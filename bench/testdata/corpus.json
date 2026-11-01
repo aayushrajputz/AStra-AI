@@ -1,0 +1,42 @@
+{
+  "name": "AStra M1 curated sample Git commits",
+  "source": "Synthetic, locally generated Git commits modeling controller, middleware, unrelated-file, and dynamic-route changes; not an external open-source benchmark corpus.",
+  "cases": [
+    {
+      "id": "controller-required-parameter",
+      "description": "A controller dependency gains a required parameter.",
+      "directory": "controller-required-parameter",
+      "breaking_routes": ["GET /accounts/:id"],
+      "known_routes": ["GET /accounts/:id", "GET /status"]
+    },
+    {
+      "id": "middleware-auth-change",
+      "description": "Authorization middleware changes behavior for a protected controller route.",
+      "directory": "middleware-auth-change",
+      "breaking_routes": ["GET /admin"],
+      "known_routes": ["GET /admin", "GET /status"]
+    },
+    {
+      "id": "nonbreaking-controller-change",
+      "description": "A response adds a harmless informational field.",
+      "directory": "nonbreaking-controller-change",
+      "breaking_routes": [],
+      "known_routes": ["GET /health"]
+    },
+    {
+      "id": "unrelated-documentation-change",
+      "description": "Documentation changes while an unrelated controller remains untouched.",
+      "directory": "unrelated-documentation-change",
+      "breaking_routes": [],
+      "known_routes": ["GET /status"]
+    },
+    {
+      "id": "dynamic-route-dependency-change",
+      "description": "A dependency used by a dynamically composed route changes.",
+      "directory": "dynamic-route-dependency-change",
+      "breaking_routes": ["GET /items/:id"],
+      "known_routes": ["GET /items/:id", "GET /health"],
+      "uncertain_routes": ["GET /items/:id"]
+    }
+  ]
+}
