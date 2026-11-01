@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: npm and release version to publish (for example 0.2.6)
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -19,6 +25,18 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Using release version: $VERSION"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -45,10 +63,26 @@ jobs:
           version: "~> v2"
           args: release --clean
 
-      - name: Publish npm package when a token is configured
-        if: env.NPM_TOKEN != ''
-        working-directory: npm/astra-ai
+      - name: Validate npm token
+        shell: bash
         run: |
-          node -e "const fs=require('node:fs');const p=require('./package.json');p.version=process.env.GITHUB_REF_NAME.replace(/^v/,'');fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
-          npm config set //registry.npmjs.org/:_authToken "$NPM_TOKEN"
+          if [ -z "${NPM_TOKEN:-}" ]; then
+            echo "NPM_TOKEN is not configured in repository secrets; npm publish will be skipped."
+            exit 1
+          fi
+
+      - name: Set npm package version
+        working-directory: npm/astra-ai
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          npm version "$RELEASE_VERSION" --no-git-tag-version --allow-same-version
+          node -p "require('./package.json').version"
+
+      - name: Publish npm package
+        working-directory: npm/astra-ai
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm config set //registry.npmjs.org/:_authToken "$NODE_AUTH_TOKEN"
           npm publish --access public

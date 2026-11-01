@@ -4,13 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: npm version to publish (for example 0.2.3)
+        description: npm version to publish (for example 0.2.6)
         required: true
         type: string
       npm_scope:
         description: npm account scope without @
         required: true
         type: string
+        default: trietitan
 
 permissions:
   contents: read
@@ -40,16 +41,22 @@ jobs:
       - name: Test npm launcher
         run: npm test --prefix npm/astra-ai
 
-      - name: Set package version
+      - name: Set package version and name
         working-directory: npm/astra-ai
         env:
           PACKAGE_VERSION: ${{ inputs.version }}
           NPM_SCOPE: ${{ inputs.npm_scope }}
         run: |
-          node -e "const fs=require('node:fs');const p=require('./package.json');p.name='@'+process.env.NPM_SCOPE+'/astra-ai';p.version=process.env.PACKAGE_VERSION;fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
+          npm pkg set name="@${NPM_SCOPE}/astra-ai" version="$PACKAGE_VERSION"
+          node -p "require('./package.json').name + ' ' + require('./package.json').version"
 
       - name: Publish scoped package
         working-directory: npm/astra-ai
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "NPM_TOKEN is not configured in repository secrets."
+            exit 1
+          fi
+          npm publish --access public
