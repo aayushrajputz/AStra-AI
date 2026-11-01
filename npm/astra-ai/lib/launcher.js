@@ -5,6 +5,7 @@ const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
+const { version: packageVersion } = require("../package.json");
 
 const platformTargets = {
   win32: "windows",
@@ -52,6 +53,10 @@ function parseChecksum(checksumText, filename) {
 
 function sha256(buffer) {
   return crypto.createHash("sha256").update(buffer).digest("hex");
+}
+
+function resolveVersion(version) {
+  return version ?? packageVersion;
 }
 
 function constantTimeEqual(left, right) {
@@ -131,7 +136,10 @@ async function ensureBinary(options = {}) {
 }
 
 async function run(args, options = {}) {
-  const binaryPath = await ensureBinary(options);
+  const binaryPath = await ensureBinary({
+    ...options,
+    version: resolveVersion(options.version),
+  });
   await new Promise((resolve, reject) => {
     const child = spawn(binaryPath, args, { stdio: "inherit", windowsHide: true });
     child.once("error", error => reject(new Error(`Could not start AStra: ${error.message}`, { cause: error })));
@@ -150,6 +158,7 @@ module.exports = {
   assetName,
   ensureBinary,
   parseChecksum,
+  resolveVersion,
   resolveTarget,
   run,
 };

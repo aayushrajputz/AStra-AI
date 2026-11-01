@@ -10,8 +10,14 @@ const {
   assetName,
   ensureBinary,
   parseChecksum,
+  resolveVersion,
   resolveTarget,
 } = require("../lib/launcher.js");
+
+test("defaults the launcher to its published package version", () => {
+  assert.equal(resolveVersion(undefined), require("../package.json").version);
+  assert.equal(resolveVersion("9.8.7"), "9.8.7");
+});
 
 test("maps supported Node platforms to Go release targets", () => {
   assert.deepEqual(resolveTarget("win32", "x64"), { goos: "windows", goarch: "amd64" });
