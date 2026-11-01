@@ -96,6 +96,17 @@ type functionInfo struct {
 	imports   map[string]importedSymbol
 }
 
+type topLevelSymbol struct {
+	id        string
+	file      string
+	name      string
+	kind      string
+	startLine int
+	endLine   int
+	exported  bool
+	hash      string
+}
+
 type functionParameter struct {
 	name     string
 	typeName string
@@ -862,6 +873,322 @@ func indexFunctions(files []sourceFile) map[string][]functionInfo {
 	return functions
 }
 
+func indexTopLevelSymbols(files []sourceFile) map[string]topLevelSymbol {
+	symbols := make(map[string]topLevelSymbol)
+	for _, file := range files {
+		for i := 0; i < len(file.tokens); i++ {
+			if file.tokens[i].text == "const" || file.tokens[i].text == "let" || file.tokens[i].text == "var" {
+				for j := i + 1; j < len(file.tokens); j++ {
+					if file.tokens[j].kind != identifierToken {
+						if file.tokens[j].text == ";" || file.tokens[j].text == "}" {
+							break
+						}
+						continue
+					}
+					if j > i+1 && file.tokens[j-1].text == "," {
+						name := file.tokens[j].text
+						if name == "" || isControlWord(name) {
+							continue
+						}
+						if file.tokens[j+1].text == "=" || file.tokens[j+1].text == "," || file.tokens[j+1].text == ";" {
+							if declarationLooksLikeFunction(file.tokens, j+1) {
+								continue
+							}
+							id := file.path + "\x00" + name
+							symbols[id] = topLevelSymbol{ id: id, file: file.path, name: name, kind: "const",
+								startLine: file.tokens[i].line, endLine: file.tokens[j].line, exported: false, hash: hashTokens(file.tokens, i, j+1)}
+						}
+						continue
+					}
+					if j == i+1 {
+						name := file.tokens[j].text
+						if name == "" || isControlWord(name) {
+							continue
+						}
+						if j+1 < len(file.tokens) && (file.tokens[j+1].text == "=" || file.tokens[j+1].text == "," || file.tokens[j+1].text == ";") {
+							if declarationLooksLikeFunction(file.tokens, j+1) {
+								continue
+							}
+							id := file.path + "\x00" + name
+							symbols[id] = topLevelSymbol{ id: id, file: file.path, name: name, kind: "const",
+								startLine: file.tokens[i].line, endLine: file.tokens[j].line, exported: false, hash: hashTokens(file.tokens, i, j+1)}
+						}
+					}
+				}
+			}
+			if file.tokens[i].text == "type" && i+1 < len(file.tokens) && file.tokens[i+1].kind == identifierToken {
+				name := file.tokens[i+1].text
+				id := file.path + "\x00" + name
+				symbols[id] = topLevelSymbol{id: id, file: file.path, name: name, kind: "type",
+					startLine: file.tokens[i].line, endLine: file.tokens[i+1].line, exported: false, hash: hashTokens(file.tokens, i, i+2)}
+			}
+			if file.tokens[i].text == "interface" && i+1 < len(file.tokens) && file.tokens[i+1].kind == identifierToken {
+				name := file.tokens[i+1].text
+				id := file.path + "\x00" + name
+				symbols[id] = topLevelSymbol{id: id, file: file.path, name: name, kind: "type",
+					startLine: file.tokens[i].line, endLine: file.tokens[i+1].line, exported: false, hash: hashTokens(file.tokens, i, i+2)}
+			}
+			if file.tokens[i].text == "enum" && i+1 < len(file.tokens) && file.tokens[i+1].kind == identifierToken {
+				name := file.tokens[i+1].text
+				id := file.path + "\x00" + name
+				symbols[id] = topLevelSymbol{id: id, file: file.path, name: name, kind: "enum",
+					startLine: file.tokens[i].line, endLine: file.tokens[i+1].line, exported: false, hash: hashTokens(file.tokens, i, i+2)}
+			}
+			if file.tokens[i].text == "export" {
+				if i+2 < len(file.tokens) && file.tokens[i+1].text == "const" && file.tokens[i+2].kind == identifierToken {
+					if declarationLooksLikeFunction(file.tokens, i+2) {
+						continue
+					}
+					name := file.tokens[i+2].text
+					id := file.path + "\x00" + name
+					symbols[id] = topLevelSymbol{id: id, file: file.path, name: name, kind: "const",
+						startLine: file.tokens[i+1].line, endLine: file.tokens[i+2].line, exported: true, hash: hashTokens(file.tokens, i+1, i+3)}
+				}
+				if i+2 < len(file.tokens) && file.tokens[i+1].text == "type" && file.tokens[i+2].kind == identifierToken {
+					name := file.tokens[i+2].text
+					id := file.path + "\x00" + name
+					symbols[id] = topLevelSymbol{id: id, file: file.path, name: name, kind: "type",
+						startLine: file.tokens[i+1].line, endLine: file.tokens[i+2].line, exported: true, hash: hashTokens(file.tokens, i+1, i+3)}
+				}
+			}
+		}
+	}
+	return symbols
+}
+
+func indexSymbolReferences(files []sourceFile, symbols map[string]topLevelSymbol) (map[string]map[string]bool, map[string]map[string]bool, map[string]map[string]bool) {
+	graphConsumers := make(map[string]map[string]bool)
+	graphUses := make(map[string]map[string]bool)
+	graphUsedBy := make(map[string]map[string]bool)
+	byName := make(map[string]map[string]bool)
+	for _, file := range files {
+		for _, symbol := range symbols {
+			if symbol.file == file.path {
+				if byName[file.path] == nil {
+					byName[file.path] = make(map[string]bool)
+				}
+				byName[file.path][symbol.name] = true
+			}
+		}
+	}
+	for _, file := range files {
+		for i := 0; i+1 < len(file.tokens); i++ {
+			if file.tokens[i].kind != identifierToken || file.tokens[i+1].text != "(" {
+				continue
+			}
+			name := file.tokens[i].text
+			if isControlWord(name) || name == "" {
+				continue
+			}
+			close := matchingToken(file.tokens, i+1, "(", ")")
+			if close < 0 {
+				continue
+			}
+			args := splitArguments(file.tokens, i+2, close)
+			for _, arg := range args {
+				for j := arg[0]; j < arg[1]; j++ {
+					if file.tokens[j].kind != identifierToken {
+						continue
+					}
+					candidate := file.tokens[j].text
+					if symbolID, ok := resolveSymbolID(file.path, candidate, byName, file.imports, symbols); ok {
+						addGraphEdge(graphConsumers, symbolID, "function:"+name)
+						addGraphEdge(graphUses, symbolID, "function:"+name)
+						addGraphEdge(graphUsedBy, "function:"+name, symbolID)
+					}
+				}
+			}
+		}
+		for i := 0; i < len(file.tokens); i++ {
+			if file.tokens[i].text != "function" && file.tokens[i].text != "const" && file.tokens[i].text != "let" &&
+				file.tokens[i].text != "var" && file.tokens[i].text != "=>" {
+				continue
+			}
+			name, start, end, ok := functionRangeForFile(file, i)
+			if !ok {
+				continue
+			}
+			for j := start; j < end; j++ {
+				if file.tokens[j].kind != identifierToken {
+					continue
+				}
+				candidate := file.tokens[j].text
+				if candidate == "" || isControlWord(candidate) || candidate == name {
+					continue
+				}
+				if symbolID, ok := resolveSymbolID(file.path, candidate, byName, file.imports, symbols); ok {
+					addGraphEdge(graphConsumers, symbolID, "function:"+name)
+					addGraphEdge(graphUses, symbolID, "function:"+name)
+					addGraphEdge(graphUsedBy, "function:"+name, symbolID)
+				}
+			}
+		}
+	}
+	return graphConsumers, graphUses, graphUsedBy
+}
+
+func resolveSymbolID(filePath, name string, byName map[string]map[string]bool,
+	imports map[string]importedSymbol, symbols map[string]topLevelSymbol) (string, bool) {
+	if byName[filePath] != nil && byName[filePath][name] {
+		return filePath + "\x00" + name, true
+	}
+	if imported, ok := imports[name]; ok {
+		if imported.file != "" && imported.symbol != "" {
+			return imported.file + "\x00" + imported.symbol, true
+		}
+	}
+	for id, symbol := range symbols {
+		if symbol.name == name && symbol.file == filePath {
+			return id, true
+		}
+	}
+	return "", false
+}
+
+func addGraphEdge(edges map[string]map[string]bool, from, to string) {
+	if edges[from] == nil {
+		edges[from] = make(map[string]bool)
+	}
+	edges[from][to] = true
+}
+
+func functionRangeForFile(file sourceFile, index int) (string, int, int, bool) {
+	if file.tokens[index].text == "function" {
+		if index+1 >= len(file.tokens) || file.tokens[index+1].kind != identifierToken {
+			return "", 0, 0, false
+		}
+		name := file.tokens[index+1].text
+		bodyStart := index + 2
+		for bodyStart < len(file.tokens) && file.tokens[bodyStart].text != "{" {
+			bodyStart++
+		}
+		if bodyStart >= len(file.tokens) {
+			return "", 0, 0, false
+		}
+		bodyEnd := matchingToken(file.tokens, bodyStart, "{", "}")
+		if bodyEnd < 0 {
+			return "", 0, 0, false
+		}
+		return name, bodyStart+1, bodyEnd, true
+	}
+	if file.tokens[index].text == "const" || file.tokens[index].text == "let" || file.tokens[index].text == "var" {
+		if index+1 >= len(file.tokens) || file.tokens[index+1].kind != identifierToken {
+			return "", 0, 0, false
+		}
+		name := file.tokens[index+1].text
+		bodyStart := index + 2
+		for bodyStart < len(file.tokens) && file.tokens[bodyStart].text != "=" && file.tokens[bodyStart].text != ";" {
+			bodyStart++
+		}
+		if bodyStart >= len(file.tokens) || file.tokens[bodyStart].text != "=" {
+			return "", 0, 0, false
+		}
+		bodyEnd := bodyStart + 1
+		for bodyEnd < len(file.tokens) && file.tokens[bodyEnd].text != ";" && file.tokens[bodyEnd].text != "}" {
+			bodyEnd++
+		}
+		if bodyEnd >= len(file.tokens) {
+			return "", 0, 0, false
+		}
+		return name, bodyStart+1, bodyEnd, true
+	}
+	return "", 0, 0, false
+}
+
+func declarationLooksLikeFunction(tokens []token, start int) bool {
+	for i := start; i < len(tokens); i++ {
+		if tokens[i].text == ";" || tokens[i].text == "}" {
+			return false
+		}
+		if tokens[i].text == "=>" || tokens[i].text == "function" {
+			return true
+		}
+	}
+	return false
+}
+
+func hashTokens(tokens []token, start, end int) string {
+	var builder strings.Builder
+	for i := start; i < end && i < len(tokens); i++ {
+		builder.WriteString(tokens[i].text)
+	}
+	return builder.String()
+}
+
+func changedTopLevelSymbols(fileChange diff.File, symbols map[string]topLevelSymbol) []string {
+	matches := make([]string, 0)
+	for id, symbol := range symbols {
+		if symbol.file != fileChange.Path {
+			continue
+		}
+		if fileChange.Status == diff.Deleted && symbol.startLine >= 1 {
+			matches = append(matches, id)
+			continue
+		}
+		for _, change := range fileChange.Changes {
+			if change.Kind == diff.DeletedChange {
+				if change.OldLine >= symbol.startLine && change.OldLine <= symbol.endLine {
+					matches = append(matches, id)
+					break
+				}
+			}
+			if change.Kind == diff.AddedChange {
+				if change.NewLine >= symbol.startLine && change.NewLine <= symbol.endLine {
+					matches = append(matches, id)
+					break
+				}
+			}
+		}
+	}
+	return matches
+}
+
+func findRoutesForTopLevelSymbol(symbolID string, routes []Route, files []sourceFile,
+	symbols map[string]topLevelSymbol, symbolConsumers map[string]map[string]bool,
+	symbolUses map[string]map[string]bool, symbolUsedBy map[string]map[string]bool) []RouteImpact {
+	current := []string{symbolID}
+	seen := make(map[string]bool)
+	functions := make(map[string]bool)
+	for len(current) > 0 {
+		id := current[0]
+		current = current[1:]
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		for consumer := range symbolConsumers[id] {
+			functions[consumer] = true
+		}
+		for dep := range symbolUses[id] {
+			current = append(current, dep)
+		}
+		for dep := range symbolUsedBy[id] {
+			current = append(current, dep)
+		}
+	}
+	if len(functions) == 0 {
+		return nil
+	}
+	impacts := make([]RouteImpact, 0)
+	for _, route := range routes {
+		for _, handler := range route.Handlers {
+			consumerKey := "function:" + handler
+			if handler == symbols[symbolID].name || functions[consumerKey] {
+				impacts = append(impacts, RouteImpact{
+					Route:      route,
+					Chain:      []string{symbols[symbolID].name, handler},
+					Reason:     "top-level symbol changed and is used by the route handler",
+					Confidence: "exact",
+					Severity:   "potential",
+					Symbol:     symbols[symbolID].name,
+				})
+				break
+			}
+		}
+	}
+	return impacts
+}
+
 func arrowName(tokens []token, arrow int) (int, int, bool) {
 	parenDepth, bracketDepth, braceDepth := 0, 0, 0
 	for i := arrow - 1; i >= 0; i-- {
@@ -985,6 +1312,8 @@ func affectedRoutes(routes []Route, changes []diff.File, functions map[string][]
 	added := make(map[string]bool)
 	schemas := indexContractSchemas(files)
 	routeContracts := indexRouteContracts(routes, files, schemas)
+	symbols := indexTopLevelSymbols(files)
+	symbolConsumers, symbolUses, symbolUsedBy := indexSymbolReferences(files, symbols)
 	for _, fileChange := range changes {
 		if isCosmetic(fileChange) {
 			continue
@@ -997,6 +1326,20 @@ func affectedRoutes(routes []Route, changes []diff.File, functions map[string][]
 				Severity: finding.severity,
 			})
 			added[routeKey(finding.route)] = true
+		}
+		changedSymbols := changedTopLevelSymbols(fileChange, symbols)
+		if len(changedSymbols) > 0 {
+			for _, symbolID := range changedSymbols {
+				for _, impact := range findRoutesForTopLevelSymbol(symbolID, routes, files, symbols, symbolConsumers, symbolUses, symbolUsedBy) {
+					if !added[routeKey(impact.Route)] {
+						impacts = append(impacts, impact)
+						added[routeKey(impact.Route)] = true
+					}
+				}
+			}
+			if len(changedSymbols) > 0 {
+				continue
+			}
 		}
 		changedNames := make(map[string]bool)
 		removedNames := make(map[string]bool)
@@ -1555,12 +1898,29 @@ func handlerNames(tokens []token, args [][2]int) []string {
 	names := make([]string, 0)
 	seen := make(map[string]bool)
 	for _, arg := range args {
-		if arg[0] >= arg[1] || tokens[arg[0]].kind != identifierToken {
+		if arg[0] >= arg[1] {
 			continue
 		}
-		name := tokens[arg[0]].text
+		first := arg[0]
+		if first < arg[1] && tokens[first].text == "async" {
+			first++
+		}
+		if first >= arg[1] || tokens[first].kind != identifierToken {
+			continue
+		}
+		name := tokens[first].text
+		if first+1 < arg[1] && tokens[first].text == "async" && tokens[first+1].text == "(" {
+			continue
+		}
+		if first+1 < arg[1] && tokens[first+1].text == "(" {
+			if !seen[name] {
+				names = append(names, name)
+				seen[name] = true
+			}
+			continue
+		}
 		simpleReference := true
-		for i := arg[0] + 1; i < arg[1]; i += 2 {
+		for i := first + 1; i < arg[1]; i += 2 {
 			if i+1 >= arg[1] || tokens[i].text != "." || tokens[i+1].kind != identifierToken {
 				simpleReference = false
 				break

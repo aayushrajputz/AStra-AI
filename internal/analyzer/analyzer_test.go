@@ -424,6 +424,68 @@ app.get("/users", getUser);
 	}
 }
 
+func TestAnalyzeDiffTracksTopLevelSchemaSymbolToExactRoute(t *testing.T) {
+	root := t.TempDir()
+	writeSource(t, root, "routes.ts", `
+const loginSchema = z.object({
+  email: z.string(),
+});
+
+const validate = (schema) => {
+  return schema;
+};
+
+app.post("/login", validate(loginSchema));
+`)
+	changes := []diff.File{{
+		Path: "routes.ts", Status: diff.Modified,
+		Changes: []diff.Change{{
+			Kind: diff.AddedChange, NewLine: 2, Text: `  email: z.string(),
+  totpCode: z.string(),`,
+		}},
+	}}
+
+	report, err := AnalyzeDiff(root, changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.AffectedRoutes) != 1 {
+		t.Fatalf("got %d route impacts, want 1: %#v", len(report.AffectedRoutes), report.AffectedRoutes)
+	}
+	impact := report.AffectedRoutes[0]
+	if impact.Route.Method != "POST" || impact.Route.Path != "/login" {
+		t.Fatalf("expected /login impact, got %#v", impact)
+	}
+	if impact.Confidence != "exact" && impact.Confidence != "heuristic" {
+		t.Fatalf("expected exact or heuristic impact, got %q", impact.Confidence)
+	}
+}
+
+func TestAnalyzeDiffIgnoresUnrelatedTopLevelConstChange(t *testing.T) {
+	root := t.TempDir()
+	writeSource(t, root, "routes.ts", `
+const loginSchema = z.object({ email: z.string() });
+const unrelated = { enabled: true };
+
+const validate = (schema) => schema;
+app.post("/login", validate(loginSchema));
+`)
+	changes := []diff.File{{
+		Path: "routes.ts", Status: diff.Modified,
+		Changes: []diff.Change{{
+			Kind: diff.AddedChange, NewLine: 3, Text: `  enabled: false,`,
+		}},
+	}}
+
+	report, err := AnalyzeDiff(root, changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.AffectedRoutes) != 0 {
+		t.Fatalf("unrelated const change should not affect routes: %#v", report.AffectedRoutes)
+	}
+}
+
 func TestAnalyzeDiffClassifiesRequestAndResponseContractFieldChanges(t *testing.T) {
 	tests := []struct {
 		name         string
