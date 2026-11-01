@@ -18,22 +18,42 @@ location.
 
 ### Install a release
 
-The npm launcher downloads the matching AStra release binary on first use,
-verifies it against the release's SHA-256 checksum, and caches it under
-`~/.astra/bin`. Node.js 18 or newer is required for the launcher. First use
-requires network access to GitHub Releases; the Go analyzer itself remains
-local and offline after installation.
+Prebuilt binaries are published for Windows, Linux, and macOS on `amd64` and
+`arm64`. Download the matching executable and `checksums.txt` from the
+[latest GitHub Release](https://github.com/aayushrajputz/AStra-AI/releases/latest).
+For Windows x64, the asset is named `astra_<version>_windows_amd64.exe`.
+Put `astra.exe` in a directory on `PATH`, then run:
 
 ```powershell
-npx astra-ai check
-npx astra-ai list-routes
-npx astra-ai mcp
+astra check
+astra list-routes
+astra mcp
 ```
 
-Prebuilt binaries are published for Windows, Linux, and macOS on `amd64` and
-`arm64`. Releases are created from `v*` tags by the GitHub Actions workflow;
-publishing `astra-ai` to npm is optional and requires the repository's
-`NPM_TOKEN` secret. To test the launcher locally without publishing:
+In PowerShell, you can install the Windows x64 binary for the current user
+(replace the version if a newer release is available):
+
+```powershell
+$installDir = Join-Path $HOME ".astra\bin"
+New-Item -ItemType Directory -Force $installDir | Out-Null
+Invoke-WebRequest `
+  "https://github.com/aayushrajputz/AStra-AI/releases/download/v0.2.2/astra_0.2.2_windows_amd64.exe" `
+  -OutFile (Join-Path $installDir "astra.exe")
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if (($userPath -split ";") -notcontains $installDir) {
+  [Environment]::SetEnvironmentVariable("Path", "$userPath;$installDir", "User")
+}
+$env:Path = "$installDir;$env:Path"
+astra --help
+```
+
+Reopen PowerShell after installation for the persistent `PATH` update to take
+effect in new terminals. Releases are created from `v*` tags by GitHub Actions;
+each binary asset is accompanied by a SHA-256 checksum in `checksums.txt`.
+
+The npm launcher is tested in this repository but is not published yet: the
+unscoped `astra-ai` name is already owned by an unrelated npm package, and
+publishing also requires an npm token. To test the launcher locally:
 
 ```powershell
 npm test --prefix npm/astra-ai
