@@ -1,6 +1,6 @@
 {
   "name": "@trietitan/astra-ai",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "AStra local route impact analysis CLI",
   "homepage": "https://github.com/aayushrajputz/AStra-AI",
   "repository": {

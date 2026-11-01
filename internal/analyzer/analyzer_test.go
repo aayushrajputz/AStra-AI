@@ -486,6 +486,422 @@ app.post("/login", validate(loginSchema));
 	}
 }
 
+func TestAnalyzeDiffMarksUnclassifiedZodSchemaDirectionUnknown(t *testing.T) {
+	root := t.TempDir()
+	writeSource(t, root, "routes.ts", `
+const payloadSchema = z.object({ name: z.string() });
+const inspectSchema = (schema) => schema;
+const handler = (req, res) => res.send("ok");
+app.post("/items", inspectSchema(payloadSchema), handler);
+`)
+	changes := []diff.File{{
+		Path: "routes.ts", Status: diff.Modified,
+		Changes: []diff.Change{{
+			Kind: diff.AddedChange, NewLine: 2, Text: `  name: z.string(),
+  label: z.string(),`,
+		}},
+	}}
+
+	report, err := AnalyzeDiff(root, changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.AffectedRoutes) != 1 {
+		t.Fatalf("got %d route impacts, want one uncertain schema impact: %#v",
+			len(report.AffectedRoutes), report.AffectedRoutes)
+	}
+	impact := report.AffectedRoutes[0]
+	if impact.Route.Path != "/items" || impact.Confidence != "heuristic" ||
+		impact.Reason != "schema direction unknown - review" {
+		t.Fatalf("unclassified schema direction was guessed: %#v", impact)
+	}
+}
+
+func TestAnalyzeDiffTracksNestedZodFieldThroughAliasedBarrelMiddleware(t *testing.T) {
+	root := filepath.Join("testdata", "sample")
+	changes := []diff.File{{
+		Path: "src/validators/auth.validator.ts", Status: diff.Modified,
+		Changes: []diff.Change{{
+			Kind: diff.AddedChange, NewLine: 4, Text: "    totpCode: z.string(),",
+		}},
+	}}
+
+	report, err := AnalyzeDiff(root, changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.AffectedRoutes) != 1 {
+		t.Fatalf("got %d route impacts, want exactly POST /login: %#v", len(report.AffectedRoutes), report.AffectedRoutes)
+	}
+	impact := report.AffectedRoutes[0]
+	if impact.Route.Method != "POST" || impact.Route.Path != "/login" ||
+		impact.Confidence != "exact" || impact.Severity != "breaking" ||
+		!strings.Contains(impact.Reason, "body.totpCode") {
+		t.Fatalf("nested Zod field did not resolve as an exact breaking login impact: %#v", impact)
+	}
+	if strings.Join(impact.Chain, " > ") != "loginSchema > validateRequest > POST /login" {
+		t.Fatalf("unexpected middleware impact chain: %#v", impact.Chain)
+	}
+}
+
+func TestAnalyzeDiffClassifiesNestedZodOptionalAndDefaultFields(t *testing.T) {
+	tests := []struct {
+		name       string
+		modifier   string
+		wantReason string
+	}{
+		{name: "optional field", modifier: ".optional()", wantReason: `optional request field "body.totpCode" was added`},
+		{name: "default field", modifier: `.default("generated")`, wantReason: `optional request field "body.totpCode" was added`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeSource(t, root, "schema.ts", `export const loginSchema = z.object({
+  body: z.object({
+    email: z.string(),
+    totpCode: z.string()`+test.modifier+`,
+  }),
+});
+`)
+			writeSource(t, root, "routes.ts", `import { loginSchema } from "./schema";
+function validateRequest(schema) { return schema; }
+function login(req, res) {}
+router.post("/login", validateRequest(loginSchema), login);
+`)
+			report, err := AnalyzeDiff(root, []diff.File{{
+				Path: "schema.ts", Status: diff.Modified,
+				Changes: []diff.Change{{Kind: diff.AddedChange, NewLine: 4, Text: "    totpCode: z.string()" + test.modifier + ","}},
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(report.AffectedRoutes) != 1 {
+				t.Fatalf("got %d impacts, want one login impact: %#v", len(report.AffectedRoutes), report.AffectedRoutes)
+			}
+			impact := report.AffectedRoutes[0]
+			if impact.Severity != "non-breaking" || !strings.Contains(impact.Reason, test.wantReason) {
+				t.Fatalf("optional/default Zod addition was misclassified: %#v", impact)
+			}
+		})
+	}
+}
+
+func TestAnalyzeDiffClassifiesZodConstraintTighteningAsHeuristicBreaking(t *testing.T) {
+	root := t.TempDir()
+	writeSource(t, root, "schema.ts", `export const loginSchema = z.object({
+  body: z.object({
+    password: z.string().min(8),
+  }),
+});
+`)
+	writeSource(t, root, "routes.ts", `import { loginSchema } from "./schema";
+function validateRequest(schema) { return schema; }
+function login(req, res) {}
+router.post("/login", validateRequest(loginSchema), login);
+`)
+	report, err := AnalyzeDiff(root, []diff.File{{
+		Path: "schema.ts", Status: diff.Modified,
+		Changes: []diff.Change{
+			{Kind: diff.DeletedChange, OldLine: 3, Text: "    password: z.string(),"},
+			{Kind: diff.AddedChange, NewLine: 3, Text: "    password: z.string().min(8),"},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.AffectedRoutes) != 1 || report.AffectedRoutes[0].Severity != "breaking" ||
+		report.AffectedRoutes[0].Confidence != "heuristic" ||
+		!strings.Contains(report.AffectedRoutes[0].Reason, "constraint tightened") {
+		t.Fatalf("constraint tightening was not reported as heuristic breaking: %#v", report.AffectedRoutes)
+	}
+}
+
+func TestAnalyzeDiffClassifiesNestedZodRemovalAndEnumRemoval(t *testing.T) {
+	tests := []struct {
+		name       string
+		schema     string
+		changes    []diff.Change
+		wantReason string
+	}{
+		{
+			name: "nested field removed",
+			schema: `export const loginSchema = z.object({
+  body: z.object({
+    email: z.string(),
+  }),
+});
+`,
+			changes:    []diff.Change{{Kind: diff.DeletedChange, OldLine: 4, Text: "    totpCode: z.string(),"}},
+			wantReason: `request field "body.totpCode" was removed`,
+		},
+		{
+			name: "enum value removed",
+			schema: `export const loginSchema = z.object({
+  body: z.object({
+    status: z.enum(["active"]),
+  }),
+});
+`,
+			changes: []diff.Change{
+				{Kind: diff.DeletedChange, OldLine: 3, Text: `    status: z.enum(["active", "pending"]),`},
+				{Kind: diff.AddedChange, NewLine: 3, Text: `    status: z.enum(["active"]),`},
+			},
+			wantReason: `enum value "pending" was removed`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeSource(t, root, "schema.ts", test.schema)
+			writeSource(t, root, "routes.ts", `import { loginSchema } from "./schema";
+function validateRequest(schema) { return schema; }
+function login(req, res) {}
+router.post("/login", validateRequest(loginSchema), login);
+`)
+			report, err := AnalyzeDiff(root, []diff.File{{
+				Path: "schema.ts", Status: diff.Modified, Changes: test.changes,
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(report.AffectedRoutes) != 1 || report.AffectedRoutes[0].Severity != "breaking" ||
+				!strings.Contains(report.AffectedRoutes[0].Reason, test.wantReason) {
+				t.Fatalf("nested schema removal was misclassified: %#v", report.AffectedRoutes)
+			}
+		})
+	}
+}
+
+func TestAnalyzeDiffMarksUnsupportedZodLogicForReview(t *testing.T) {
+	root := t.TempDir()
+	writeSource(t, root, "schema.ts", `export const loginSchema = z.object({
+  body: z.object({
+    email: z.string(),
+  }),
+}).refine(value => Boolean(value));
+`)
+	writeSource(t, root, "routes.ts", `import { loginSchema } from "./schema";
+function validateRequest(schema) { return schema; }
+function login(req, res) {}
+router.post("/login", validateRequest(loginSchema), login);
+`)
+	report, err := AnalyzeDiff(root, []diff.File{{
+		Path: "schema.ts", Status: diff.Modified,
+		Changes: []diff.Change{{Kind: diff.AddedChange, NewLine: 5, Text: "}).refine(value => Boolean(value));"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.AffectedRoutes) != 1 ||
+		report.AffectedRoutes[0].Severity != "body-changed" ||
+		report.AffectedRoutes[0].Confidence != "heuristic" ||
+		report.AffectedRoutes[0].Reason != "schema logic changed - review" {
+		t.Fatalf("unsupported Zod logic change was guessed instead of marked for review: %#v", report.AffectedRoutes)
+	}
+}
+
+func TestAnalyzeDiffFindsSchemaParsedInsideImportedHandler(t *testing.T) {
+	root := t.TempDir()
+	writeSource(t, root, "schema.ts", `export const loginSchema = z.object({
+  body: z.object({
+    email: z.string(),
+    totpCode: z.string(),
+  }),
+});
+`)
+	writeSource(t, root, "controllers/auth.ts", `import { loginSchema } from "../schema";
+export function login(req: Request, res: Response) {
+  loginSchema.parse(req.body);
+}
+`)
+	writeSource(t, root, "routes.ts", `import { login } from "./controllers/auth";
+router.post("/login", login);
+`)
+	report, err := AnalyzeDiff(root, []diff.File{{
+		Path: "schema.ts", Status: diff.Modified,
+		Changes: []diff.Change{{Kind: diff.AddedChange, NewLine: 4, Text: "    totpCode: z.string(),"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.AffectedRoutes) != 1 || report.AffectedRoutes[0].Route.Path != "/login" ||
+		report.AffectedRoutes[0].Severity != "breaking" ||
+		!strings.Contains(report.AffectedRoutes[0].Reason, "body.totpCode") {
+		t.Fatalf("handler .parse(req.body) schema reference was not traced: %#v", report.AffectedRoutes)
+	}
+}
+
+func TestAnalyzeDiffReportsOnlyRoutesUsingSharedSchema(t *testing.T) {
+	root := t.TempDir()
+	writeSource(t, root, "schema.ts", `export const sharedSchema = z.object({
+  body: z.object({
+    code: z.string(),
+    totpCode: z.string(),
+  }),
+});
+`)
+	writeSource(t, root, "routes.ts", `import { sharedSchema } from "./schema";
+function validate(schema) { return schema; }
+function login(req, res) {}
+function verify(req, res) {}
+router.post("/login", validate(sharedSchema), login);
+router.post("/verify", validate(sharedSchema), verify);
+router.get("/health", health);
+`)
+	report, err := AnalyzeDiff(root, []diff.File{{
+		Path: "schema.ts", Status: diff.Modified,
+		Changes: []diff.Change{{Kind: diff.AddedChange, NewLine: 4, Text: "    totpCode: z.string(),"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.AffectedRoutes) != 2 {
+		t.Fatalf("got %d impacts, want the two schema-consuming routes: %#v", len(report.AffectedRoutes), report.AffectedRoutes)
+	}
+	paths := map[string]bool{}
+	for _, impact := range report.AffectedRoutes {
+		paths[impact.Route.Path] = true
+	}
+	if !paths["/login"] || !paths["/verify"] || paths["/health"] {
+		t.Fatalf("schema impacts were not limited to its two consumers: %#v", paths)
+	}
+}
+
+func TestAnalyzeDiffDoesNotCreateEdgeForShadowedSchemaParameter(t *testing.T) {
+	root := t.TempDir()
+	writeSource(t, root, "server.ts", `const schema = z.object({ email: z.string() });
+function unrelated(schema) {
+  schema.parse(req.body);
+}
+app.post("/unrelated", unrelated);
+`)
+	report, err := AnalyzeDiff(root, []diff.File{{
+		Path: "server.ts", Status: diff.Modified,
+		Changes: []diff.Change{{Kind: diff.AddedChange, NewLine: 1, Text: `const schema = z.object({ email: z.string(), code: z.string() });`}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.AffectedRoutes) != 0 {
+		t.Fatalf("shadowed local parameter incorrectly created a top-level symbol edge: %#v", report.AffectedRoutes)
+	}
+}
+
+func TestAnalyzeDiffPropagatesComposedSchemaDependency(t *testing.T) {
+	root := t.TempDir()
+	writeSource(t, root, "schemas.ts", `const factors = z.object({
+  code: z.string(),
+  totpCode: z.string(),
+});
+export const loginSchema = z.object({
+  body: factors,
+});
+`)
+	writeSource(t, root, "routes.ts", `import { loginSchema } from "./schemas";
+function validateRequest(schema) { return schema; }
+function login(req, res) {}
+router.post("/login", validateRequest(loginSchema), login);
+`)
+	report, err := AnalyzeDiff(root, []diff.File{{
+		Path: "schemas.ts", Status: diff.Modified,
+		Changes: []diff.Change{{Kind: diff.AddedChange, NewLine: 3, Text: "  totpCode: z.string(),"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.AffectedRoutes) != 1 || report.AffectedRoutes[0].Route.Path != "/login" ||
+		report.AffectedRoutes[0].Confidence != "exact" {
+		t.Fatalf("composed schema dependency did not reach its route: %#v", report.AffectedRoutes)
+	}
+}
+
+func TestAnalyzeDiffResolvesDefaultAndRequireDestructuredSchemaImports(t *testing.T) {
+	root := t.TempDir()
+	writeSource(t, root, "schema.ts", `const loginSchema = z.object({
+  body: z.object({
+    email: z.string(),
+    totpCode: z.string(),
+  }),
+});
+export default loginSchema;
+`)
+	writeSource(t, root, "routes/default.ts", `import authSchema from "../schema";
+function validateRequest(schema) { return schema; }
+function login(req, res) {}
+router.post("/default-login", validateRequest(authSchema), login);
+`)
+	writeSource(t, root, "routes/require.ts", `const { loginSchema: authSchema } = require("../schema");
+function validateRequest(schema) { return schema; }
+function login(req, res) {}
+router.post("/require-login", validateRequest(authSchema), login);
+`)
+	report, err := AnalyzeDiff(root, []diff.File{{
+		Path: "schema.ts", Status: diff.Modified,
+		Changes: []diff.Change{{Kind: diff.AddedChange, NewLine: 4, Text: "    totpCode: z.string(),"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.AffectedRoutes) != 2 {
+		t.Fatalf("got %d impacts, want default and require-imported routes: %#v",
+			len(report.AffectedRoutes), report.AffectedRoutes)
+	}
+	for _, impact := range report.AffectedRoutes {
+		if impact.Confidence != "exact" || impact.Severity != "breaking" ||
+			!strings.Contains(impact.Reason, "body.totpCode") {
+			t.Fatalf("default/require import did not produce an exact schema impact: %#v", impact)
+		}
+	}
+}
+
+func TestAnalyzeDiffReportsUntracedModuleChangeWithoutBroadRouteFallback(t *testing.T) {
+	root := t.TempDir()
+	writeSource(t, root, "src/setup.ts", `configureRuntime();
+`)
+	writeSource(t, root, "src/routes/auth.ts", `import { setup } from "../setup";
+router.post("/login", login);
+`)
+	writeSource(t, root, "src/routes/health.ts", `router.get("/health", health);
+`)
+	report, err := AnalyzeDiff(root, []diff.File{{
+		Path: "src/setup.ts", Status: diff.Modified,
+		Changes: []diff.Change{{Kind: diff.AddedChange, NewLine: 1, Text: "configureRuntime();"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.AffectedRoutes) != 1 || report.AffectedRoutes[0].Route.Path != "/login" ||
+		report.AffectedRoutes[0].Confidence != "uncertain" {
+		t.Fatalf("unattributed module change should flag only importing route as uncertain: %#v", report.AffectedRoutes)
+	}
+	if len(report.Warnings) != 1 || report.Warnings[0].Message != "change could not be traced" {
+		t.Fatalf("unattributed change did not produce an explicit warning: %#v", report.Warnings)
+	}
+}
+
+func TestAnalyzeDiffDebugTraceReportsSymbolsRouteArgumentsAndImports(t *testing.T) {
+	root := filepath.Join("testdata", "sample")
+	lines, err := DebugDiff(root, []diff.File{{
+		Path: "src/validators/auth.validator.ts", Status: diff.Modified,
+		Changes: []diff.Change{{Kind: diff.AddedChange, NewLine: 4, Text: "    totpCode: z.string(),"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	debug := strings.Join(lines, "\n")
+	for _, expected := range []string{
+		"loginSchema symbol: kind=const",
+		"POST /login route args/calls:",
+		"identifiers include loginSchema=false",
+		"loginSchema import: authSchema -> src/validators/auth.validator.ts#loginSchema",
+		"dependency symbols=[src/controllers/auth.ts",
+	} {
+		if !strings.Contains(debug, expected) {
+			t.Fatalf("debug output missing %q:\n%s", expected, debug)
+		}
+	}
+}
+
 func TestAnalyzeDiffClassifiesRequestAndResponseContractFieldChanges(t *testing.T) {
 	tests := []struct {
 		name         string

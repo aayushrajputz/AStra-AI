@@ -214,7 +214,16 @@ and **33.3% false-positive rate**; the 3,000-file warm-cache measurement was
 - Added optional (`?`) and defaulted (`= value`) function parameters are
   reported as non-breaking; other reachable changes are reported as potential
 - Request/response contract drift is detected for named TypeScript interfaces
-  and object type aliases, DTO classes, and simple Zod `z.object` schemas
+  and object type aliases, DTO classes, and Zod `z.object` request schemas,
+  including common `body`/`query`/`params` envelopes
+- Top-level non-function `const`/`let`/`var`, type aliases, interfaces, and
+  enums are indexed as symbols; route middleware arguments and composed
+  initializers can connect those symbols to affected routes
+- Zod request field additions/removals, primitive type changes, optional/default
+  additions, enum value removals, and common constraint additions are classified;
+  constraint tightening is heuristic
+- `astra check --debug` (or `ASTRA_DEBUG=1`) prints changed-range attribution,
+  route arguments, symbol references, and resolved named imports to stderr
 - Whitespace- and comment-only edits are filtered from impact findings
 - Dynamic paths on recognized HTTP route registrations produce line-specific
   warnings instead of guessed routes; unrelated `.get()` calls and calls with
@@ -227,9 +236,15 @@ callbacks to distinguish route registrations from ordinary methods such as
 NestJS edges;
 other route and call-graph findings remain heuristic (`~`). The module resolver
 reads only the repository-root `tsconfig.json`; it does not follow `extends`,
-project references, package exports, default/namespace imports, or arbitrary
-TypeScript compiler options. Barrel following supports named re-exports and
-`export *` chains. Fastify prefix handling currently supports literal prefixes
+project references, package exports, namespace imports, or arbitrary TypeScript
+compiler options. Relative modules, named/default imports, named re-exports,
+and `export *` chains are resolved when the target is statically available.
+Dynamic imports, schemas assembled in loops or runtime-generated code, unresolved
+spreads, `.refine()`/`.transform()`/`.superRefine()`, and Zod `.pick()`/`.omit()`
+or complex composition are reported for review rather than guessed. Runtime-
+generated routes and nonliteral paths are not statically traced. Unattributed
+source changes are explicitly listed; only routes importing the changed module
+are marked uncertain. Fastify prefix handling currently supports literal prefixes
 registered against named function plugins. NestJS handling supports named
 classes with literal controller/route paths and constructor parameter
 properties; custom decorators, inherited controllers, guard/interceptor
@@ -237,9 +252,9 @@ behavior, and container-driven injection are not modeled. Class-field receiver
 resolution covers simple `property = new Class()` declarations, not reassignment,
 factory functions, generic inference, or arbitrary object flow. Signature
 classification remains limited to simple, single-line function declarations
-and parenthesized arrow functions. Module-level data flow and robust scoping
-remain out of scope, so review findings and uncertainty warnings before using
-the tool as a gate.
+and parenthesized arrow functions. Module-level references are supported for
+indexed declarations, but dynamic JavaScript scope and arbitrary value flow are
+not modeled; review uncertainty warnings before using the tool as a gate.
 
 ### Go route analysis (M8)
 
@@ -278,15 +293,14 @@ also includes a Gin service-signature commit:
 | Corpus result | TP | FP | FN | TN | Precision | Recall | False-positive rate |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | Go Gin signature case | 1 | 0 | 0 | 1 | 100.0% | 100.0% | 0.0% |
-| Combined six-case corpus | 3 | 2 | 1 | 4 | 60.0% | 75.0% | 33.3% |
-| Original five TypeScript cases | 2 | 2 | 1 | 3 | 50.0% | 66.7% | 40.0% |
+| Combined six-case corpus | 3 | 1 | 1 | 5 | 75.0% | 75.0% | 16.7% |
+| Original five TypeScript cases | 2 | 1 | 1 | 4 | 66.7% | 66.7% | 20.0% |
 
-The TypeScript-only results match the pre-M8 baseline; the combined figures
-include one added Go case and are still a small synthetic smoke benchmark, not
-real-world accuracy claims. The 3,000-file warm-cache benchmark measured
-124.8 ms/op over three iterations on the same Windows development machine,
-compared with 124.7 ms/op immediately before M8, effectively unchanged and
-below the 300 ms target. These short local measurements are not a CI guarantee.
+The updated module-level fallback no longer counts unrelated documentation
+edits as route impacts; this improves the synthetic corpus figures but does not
+change its status as a smoke benchmark rather than a real-world accuracy claim.
+The 3,000-file warm-cache target remains below 300 ms/op; local measurements
+vary and are not a CI guarantee.
 
 Contract analysis associates a route handler's first typed parameter (or the
 body type in an Express `Request<Params, ResponseBody, RequestBody>`) with its

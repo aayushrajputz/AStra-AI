@@ -12,8 +12,8 @@ func TestCuratedCommitCorpusBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if metrics.TruePositives != 3 || metrics.FalsePositives != 2 ||
-		metrics.FalseNegatives != 1 || metrics.TrueNegatives != 4 || metrics.Warnings != 1 {
+	if metrics.TruePositives != 3 || metrics.FalsePositives != 1 ||
+		metrics.FalseNegatives != 1 || metrics.TrueNegatives != 5 || metrics.Warnings != 1 {
 		t.Fatalf("unexpected combined synthetic benchmark: %+v\n%s", metrics, output.String())
 	}
 	if !strings.Contains(output.String(), "~") || !strings.Contains(output.String(), "⚠") {

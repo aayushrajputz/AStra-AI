@@ -88,7 +88,7 @@ func runAt(args []string, stdout, stderr io.Writer, cwd string) error {
 		_, err := bench.Run(stdout)
 		return err
 	case "check":
-		return runCheck(args[1:], stdout, cwd)
+		return runCheck(args[1:], stdout, stderr, cwd)
 	case "list-routes":
 		return runListRoutes(args[1:], stdout, cwd)
 	case "install-hook":
@@ -102,7 +102,7 @@ func runAt(args []string, stdout, stderr io.Writer, cwd string) error {
 	}
 }
 
-func runCheck(args []string, stdout io.Writer, cwd string) error {
+func runCheck(args []string, stdout, stderr io.Writer, cwd string) error {
 	flags := flag.NewFlagSet("check", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	staged := flags.Bool("staged", false, "analyze staged changes only")
@@ -113,6 +113,8 @@ func runCheck(args []string, stdout io.Writer, cwd string) error {
 	aiModel := flags.String("ai-model", "", "model name for the selected AI provider")
 	aiEndpoint := flags.String("ai-endpoint", "", "override the provider API endpoint")
 	aiDryRun := flags.Bool("ai-dry-run", false, "print a credential-redacted AI request preview without sending it")
+	debug := flags.Bool("debug", false, "print analyzer trace diagnostics")
+	strict := flags.Bool("strict", false, "fail on uncertain or untraced changes")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -167,6 +169,17 @@ func runCheck(args []string, stdout io.Writer, cwd string) error {
 		return fmt.Errorf("parse git diff: %w", err)
 	}
 	changes = config.FilterChanges(changes)
+	if *debug || os.Getenv("ASTRA_DEBUG") == "1" {
+		lines, err := analyzer.DebugDiff(root, changes)
+		if err != nil {
+			return fmt.Errorf("debug analyzer trace: %w", err)
+		}
+		for _, line := range lines {
+			if _, err := fmt.Fprintln(stderr, line); err != nil {
+				return err
+			}
+		}
+	}
 	cacheDir, err := analyzer.DefaultCacheDir()
 	if err != nil {
 		return fmt.Errorf("resolve AStra parse cache: %w", err)
@@ -203,6 +216,22 @@ func runCheck(args []string, stdout io.Writer, cwd string) error {
 		result.NeedsReview = gateResult.NeedsReview
 		result.ActiveWaivers = gateResult.ActiveWaivers
 		result.SeverityRules = config.SeverityRules
+	}
+	if *strict {
+		for _, warning := range result.Warnings {
+			if warning.Message == "change could not be traced" {
+				result.Status = "fail"
+				result.Violations = append(result.Violations,
+					fmt.Sprintf("%s:%d: change could not be traced", warning.File, warning.Line))
+			}
+		}
+		for _, impact := range result.AffectedRoutes {
+			if impact.Confidence == "uncertain" {
+				result.Status = "fail"
+				result.Violations = append(result.Violations,
+					fmt.Sprintf("%s %s: %s", impact.Route.Method, impact.Route.Path, impact.Reason))
+			}
+		}
 	}
 	var aiErr error
 	if *aiProvider != "" {
@@ -263,7 +292,7 @@ func runCheck(args []string, stdout io.Writer, cwd string) error {
 		}
 	}
 	var commandErrors []error
-	if *gate && result.Status == "fail" {
+	if (*gate || *strict) && result.Status == "fail" {
 		commandErrors = append(commandErrors, ErrGateFailed)
 	}
 	if aiErr != nil {
@@ -479,11 +508,27 @@ func printCheck(stdout io.Writer, result checkOutput) error {
 		len(result.Routes), result.ChangedFiles); err != nil {
 		return err
 	}
-	if len(result.AffectedRoutes) == 0 {
+	untraced := make([]analyzer.Warning, 0)
+	for _, warning := range result.Warnings {
+		if warning.Message == "change could not be traced" {
+			untraced = append(untraced, warning)
+		}
+	}
+	if len(untraced) > 0 {
+		if _, err := fmt.Fprintf(stdout, "%d change(s) could not be traced:\n", len(untraced)); err != nil {
+			return err
+		}
+		for _, warning := range untraced {
+			if _, err := fmt.Fprintf(stdout, "- %s:%d\n", warning.File, warning.Line); err != nil {
+				return err
+			}
+		}
+	}
+	if len(result.AffectedRoutes) == 0 && len(untraced) == 0 {
 		if _, err := fmt.Fprintln(stdout, "No affected routes detected."); err != nil {
 			return err
 		}
-	} else {
+	} else if len(result.AffectedRoutes) > 0 {
 		if _, err := fmt.Fprintf(stdout, "Potentially affected route(s): %d\n", len(result.AffectedRoutes)); err != nil {
 			return err
 		}

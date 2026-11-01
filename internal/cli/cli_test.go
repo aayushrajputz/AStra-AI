@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/astra-ai/astra/internal/analyzer"
 	"github.com/astra-ai/astra/internal/policy"
 )
 
@@ -262,6 +263,25 @@ func TestPrintCheckIncludesActiveWaiversWithoutViolations(t *testing.T) {
 	}
 }
 
+func TestPrintCheckNeverSaysNoAffectedWhenChangeIsUntraced(t *testing.T) {
+	var output bytes.Buffer
+	err := printCheck(&output, checkOutput{
+		ChangedFiles: 1,
+		Warnings: []analyzer.Warning{{
+			File: "src/validators/auth.validator.ts", Line: 8, Message: "change could not be traced",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := output.String()
+	if !strings.Contains(text, "1 change(s) could not be traced") ||
+		!strings.Contains(text, "src/validators/auth.validator.ts:8") ||
+		strings.Contains(text, "No affected routes detected.") {
+		t.Fatalf("untraced change was silently presented as clean:\n%s", text)
+	}
+}
+
 func TestCheckRejectsBaseOptionInjection(t *testing.T) {
 	root := createGitRepo(t)
 	for _, base := range []string{"--output=report", "bad\nref"} {
@@ -424,9 +444,9 @@ func TestBenchCommandRunsEmbeddedCorpus(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, expected := range []string{
-		"Precision: 60.0%",
+		"Precision: 75.0%",
 		"Recall: 75.0%",
-		"False-positive rate: 33.3%",
+		"False-positive rate: 16.7%",
 		"go-gin-required-parameter",
 		"~ heuristic finding",
 		"⚠ dynamic/unresolved uncertainty",

@@ -75,6 +75,12 @@ func (resolver *moduleResolver) imports(file sourceFile) map[string]importedSymb
 			continue
 		}
 		for j := i + 1; j < from; j++ {
+			if tokens[j].kind == identifierToken && tokens[j].text != "type" &&
+				(j == i+1 || tokens[j-1].text == ",") {
+				exported, local := "default", tokens[j].text
+				resolvedFile, resolvedSymbol := resolver.followReexport(targetFile, exported, make(map[string]bool))
+				imports[local] = importedSymbol{file: resolvedFile, symbol: resolvedSymbol}
+			}
 			if tokens[j].text != "{" {
 				continue
 			}
@@ -100,7 +106,80 @@ func (resolver *moduleResolver) imports(file sourceFile) map[string]importedSymb
 			break
 		}
 	}
+	for i := 0; i+3 < len(tokens); i++ {
+		if tokens[i].text != "require" || tokens[i+1].text != "(" ||
+			tokens[i+2].kind != stringToken {
+			continue
+		}
+		targetFile, ok := resolver.resolve(file.path, tokens[i+2].text)
+		if !ok {
+			continue
+		}
+		open := i - 1
+		if open >= 0 && tokens[open].text == "=" {
+			open--
+		}
+		if open < 0 || tokens[open].text != "}" {
+			continue
+		}
+		for open >= 0 && tokens[open].text != "{" {
+			open--
+		}
+		if open < 0 {
+			continue
+		}
+		close := matchingToken(tokens, open, "{", "}")
+		if close < 0 || close >= i {
+			continue
+		}
+		for _, specifier := range splitArguments(tokens, open+1, close) {
+			if specifier[0] >= specifier[1] {
+				continue
+			}
+			exported, local := tokens[specifier[0]].text, tokens[specifier[0]].text
+			for j := specifier[0] + 1; j+1 < specifier[1]; j++ {
+				if tokens[j].text == ":" || tokens[j].text == "as" {
+					local = tokens[j+1].text
+					break
+				}
+			}
+			resolvedFile, resolvedSymbol := resolver.followReexport(targetFile, exported, make(map[string]bool))
+			imports[local] = importedSymbol{file: resolvedFile, symbol: resolvedSymbol}
+		}
+	}
 	return imports
+}
+
+func (resolver *moduleResolver) dependencies(file sourceFile) []string {
+	dependencies := make(map[string]bool)
+	tokens := file.tokens
+	for i := 0; i < len(tokens); i++ {
+		if tokens[i].text == "import" || tokens[i].text == "export" {
+			for j := i + 1; j+1 < len(tokens) && tokens[j].text != ";"; j++ {
+				if tokens[j].text == "from" && tokens[j+1].kind == stringToken {
+					if target, ok := resolver.resolve(file.path, tokens[j+1].text); ok {
+						dependencies[target] = true
+					}
+					break
+				}
+				if tokens[j].line > tokens[i].line {
+					break
+				}
+			}
+		}
+		if tokens[i].text == "require" && i+2 < len(tokens) && tokens[i+1].text == "(" &&
+			tokens[i+2].kind == stringToken {
+			if target, ok := resolver.resolve(file.path, tokens[i+2].text); ok {
+				dependencies[target] = true
+			}
+		}
+	}
+	result := make([]string, 0, len(dependencies))
+	for dependency := range dependencies {
+		result = append(result, dependency)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func (resolver *moduleResolver) followReexport(file, symbol string, visited map[string]bool) (string, string) {
@@ -120,6 +199,15 @@ func (resolver *moduleResolver) followReexport(file, symbol string, visited map[
 	for i := 0; i+1 < len(tokens); i++ {
 		if tokens[i].text != "export" {
 			continue
+		}
+		if tokens[i+1].text == "default" {
+			nameIndex := i + 2
+			if nameIndex < len(tokens) && tokens[nameIndex].text == "function" {
+				nameIndex++
+			}
+			if nameIndex < len(tokens) && tokens[nameIndex].kind == identifierToken {
+				return file, tokens[nameIndex].text
+			}
 		}
 		if tokens[i+1].text == "*" {
 			from := i + 2
@@ -143,6 +231,21 @@ func (resolver *moduleResolver) followReexport(file, symbol string, visited map[
 		from := close + 1
 		for from < len(tokens) && tokens[from].text != "from" && tokens[from].text != ";" {
 			from++
+		}
+		if from >= len(tokens) || tokens[from].text != "from" {
+			for _, specifier := range splitArguments(tokens, i+2, close) {
+				if specifier[0] >= specifier[1] {
+					continue
+				}
+				exported, publicName := tokens[specifier[0]].text, tokens[specifier[0]].text
+				if specifier[0]+2 < specifier[1] && tokens[specifier[0]+1].text == "as" {
+					publicName = tokens[specifier[0]+2].text
+				}
+				if publicName == symbol {
+					return file, exported
+				}
+			}
+			continue
 		}
 		if from+1 >= len(tokens) || tokens[from].text != "from" ||
 			tokens[from+1].kind != stringToken {
@@ -218,10 +321,29 @@ func sourceCandidates(path string) []string {
 	extensions := []string{".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
 	candidates := []string{path}
 	ext := filepath.Ext(path)
-	if ext == "" {
+	hasSourceExtension := false
+		for _, extension := range extensions {
+		if ext == extension {
+			hasSourceExtension = true
+			break
+		}
+	}
+	if !hasSourceExtension {
 		for _, extension := range extensions {
 			candidates = append(candidates, path+extension)
 		}
+	} else {
+		switch ext {
+		case ".js":
+			candidates = append(candidates, strings.TrimSuffix(path, ext)+".ts",
+				strings.TrimSuffix(path, ext)+".tsx")
+		case ".jsx":
+			candidates = append(candidates, strings.TrimSuffix(path, ext)+".tsx")
+		case ".mjs":
+			candidates = append(candidates, strings.TrimSuffix(path, ext)+".mts")
+		case ".cjs":
+			candidates = append(candidates, strings.TrimSuffix(path, ext)+".cts")
+	}
 	}
 	for _, extension := range extensions {
 		candidates = append(candidates, filepath.Join(path, "index"+extension))

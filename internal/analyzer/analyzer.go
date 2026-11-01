@@ -13,12 +13,14 @@ import (
 )
 
 type Route struct {
-	Method     string   `json:"method"`
-	Path       string   `json:"path"`
-	File       string   `json:"file"`
-	Line       int      `json:"line"`
-	Handlers   []string `json:"handlers,omitempty"`
-	Confidence string   `json:"confidence"`
+	Method      string   `json:"method"`
+	Path        string   `json:"path"`
+	File        string   `json:"file"`
+	Line        int      `json:"line"`
+	Handlers    []string `json:"handlers,omitempty"`
+	Middlewares []string `json:"middlewares,omitempty"`
+	DepSymbols  []string `json:"dep_symbols,omitempty"`
+	Confidence  string   `json:"confidence"`
 }
 
 type Warning struct {
@@ -81,6 +83,7 @@ type sourceFile struct {
 	path    string
 	tokens  []token
 	imports map[string]importedSymbol
+	modules []string
 	goFile  *goSourceFile
 }
 
@@ -103,6 +106,8 @@ type topLevelSymbol struct {
 	kind      string
 	startLine int
 	endLine   int
+	start     int
+	end       int
 	exported  bool
 	hash      string
 }
@@ -160,6 +165,107 @@ func AnalyzeDiff(root string, changes []diff.File) (*Report, error) {
 	return analyzeDiffFiles(files, changes), nil
 }
 
+func DebugDiff(root string, changes []diff.File) ([]string, error) {
+	files, err := loadFiles(root)
+	if err != nil {
+		return nil, err
+	}
+	symbols := indexTopLevelSymbols(files)
+	report := analyzeFiles(files)
+	var lines []string
+	for _, fileChange := range changes {
+		for _, change := range fileChange.Changes {
+			line, kind := change.NewLine, "added"
+			if change.Kind == diff.DeletedChange {
+				line, kind = change.OldLine, "deleted"
+			}
+			var attributed []string
+			for _, symbol := range symbols {
+				if symbol.file == fileChange.Path && line >= symbol.startLine && line <= symbol.endLine {
+					attributed = append(attributed, fmt.Sprintf("%s (%s:%d-%d)",
+						symbol.name, symbol.kind, symbol.startLine, symbol.endLine))
+				}
+			}
+			if len(attributed) == 0 {
+				attributed = append(attributed, "none")
+			}
+			sort.Strings(attributed)
+			lines = append(lines, fmt.Sprintf("debug: changed range %s:%d (%s), attributed to %s",
+				fileChange.Path, line, kind, strings.Join(attributed, ", ")))
+		}
+	}
+	foundLoginSchema := false
+	for _, symbol := range symbols {
+		if symbol.name == "loginSchema" {
+			foundLoginSchema = true
+			lines = append(lines, fmt.Sprintf("debug: loginSchema symbol: kind=%s file=%s lines=%d-%d",
+				symbol.kind, symbol.file, symbol.startLine, symbol.endLine))
+		}
+	}
+	if !foundLoginSchema {
+		lines = append(lines, "debug: loginSchema symbol: not found")
+	}
+	fileByPath := make(map[string]sourceFile, len(files))
+	for _, file := range files {
+		fileByPath[file.path] = file
+	}
+	foundLoginRoute := false
+	for _, route := range report.Routes {
+		if !strings.EqualFold(route.Method, "POST") || route.Path != "/login" {
+			continue
+		}
+		foundLoginRoute = true
+		file := fileByPath[route.File]
+		args := routeArguments(file, route)
+		calls := make([]string, 0)
+		identifiers := make(map[string]bool)
+		for _, arg := range args {
+			calls = append(calls, tokenText(file.tokens, arg[0], arg[1]))
+			for i := arg[0]; i < arg[1]; i++ {
+				if file.tokens[i].kind == identifierToken {
+					identifiers[file.tokens[i].text] = true
+				}
+			}
+		}
+		lines = append(lines, fmt.Sprintf("debug: POST /login route args/calls: %s; identifiers include loginSchema=%t",
+			strings.Join(calls, " | "), identifiers["loginSchema"]))
+		locals := make([]string, 0, len(file.imports))
+		for local := range file.imports {
+			locals = append(locals, local)
+		}
+		sort.Strings(locals)
+		for _, local := range locals {
+			imported := file.imports[local]
+			if local == "loginSchema" || imported.symbol == "loginSchema" {
+				lines = append(lines, fmt.Sprintf("debug: loginSchema import: %s -> %s#%s",
+					local, imported.file, imported.symbol))
+			}
+		}
+		lines = append(lines, fmt.Sprintf("debug: POST /login route middleware=%v dependency symbols=%v",
+			route.Middlewares, route.DepSymbols))
+	}
+	if !foundLoginRoute {
+		lines = append(lines, "debug: POST /login route: not found")
+	}
+	return lines, nil
+}
+
+func routeArguments(file sourceFile, route Route) [][2]int {
+	for i := 0; i+3 < len(file.tokens); i++ {
+		if file.tokens[i].line != route.Line || file.tokens[i].kind != identifierToken ||
+			file.tokens[i+1].text != "." ||
+			!strings.EqualFold(file.tokens[i+2].text, route.Method) ||
+			file.tokens[i+3].text != "(" {
+			continue
+		}
+		close := matchingToken(file.tokens, i+3, "(", ")")
+		if close >= 0 {
+			return splitArguments(file.tokens, i+4, close)
+		}
+	}
+	return nil
+}
+
 func AnalyzeDiffWithCache(root string, changes []diff.File, cacheDir string) (*Report, error) {
 	files, err := loadFilesWithCache(root, cacheDir)
 	if err != nil {
@@ -189,7 +295,9 @@ func AnalyzeDiffWithContent(root, cacheDir string, changes []diff.File,
 func analyzeDiffFiles(files []sourceFile, changes []diff.File) *Report {
 	report := analyzeFiles(files)
 	functions := indexFunctions(files)
-	report.AffectedRoutes = affectedRoutes(report.Routes, changes, functions, importsByFile(files), files)
+	impacts, warnings := affectedRoutes(report.Routes, changes, functions, importsByFile(files), files)
+	report.AffectedRoutes = impacts
+	report.Warnings = append(report.Warnings, warnings...)
 	return report
 }
 
@@ -424,6 +532,7 @@ func loadFilesUsingContent(root string, parse func(string, []byte) ([]token, err
 					}
 					file := sourceFile{path: filepath.ToSlash(relative), tokens: tokens}
 					file.imports = resolver.imports(file)
+					file.modules = resolver.dependencies(file)
 					if strings.EqualFold(filepath.Ext(path), ".go") {
 						file.goFile, err = parseGoSource(path, content)
 						if err != nil {
@@ -593,7 +702,71 @@ func analyzeFiles(files []sourceFile) *Report {
 		}
 		return a.Path < b.Path
 	})
+	annotateRouteDependencies(report.Routes, files)
 	return report
+}
+
+func annotateRouteDependencies(routes []Route, files []sourceFile) {
+	symbols := indexTopLevelSymbols(files)
+	byName := make(map[string]map[string]bool)
+	fileByPath := make(map[string]sourceFile, len(files))
+	for _, symbol := range symbols {
+		if byName[symbol.file] == nil {
+			byName[symbol.file] = make(map[string]bool)
+		}
+		byName[symbol.file][symbol.name] = true
+	}
+	for _, file := range files {
+		fileByPath[file.path] = file
+	}
+	for routeIndex := range routes {
+		route := &routes[routeIndex]
+		file, ok := fileByPath[route.File]
+		if !ok {
+			continue
+		}
+		for i := 0; i+3 < len(file.tokens); i++ {
+			if file.tokens[i].line != route.Line || file.tokens[i].kind != identifierToken ||
+				file.tokens[i+1].text != "." ||
+				!strings.EqualFold(file.tokens[i+2].text, route.Method) ||
+				file.tokens[i+3].text != "(" {
+				continue
+			}
+			close := matchingToken(file.tokens, i+3, "(", ")")
+			if close < 0 {
+				break
+			}
+			args := splitArguments(file.tokens, i+4, close)
+			for _, arg := range args[1:] {
+				if arg[0] >= arg[1] {
+					continue
+				}
+				for tokenIndex := arg[0]; tokenIndex < arg[1]; tokenIndex++ {
+					if file.tokens[tokenIndex].kind != identifierToken {
+						continue
+					}
+					name := file.tokens[tokenIndex].text
+					if tokenIndex+1 < arg[1] && file.tokens[tokenIndex+1].text == "(" {
+						middleware := name
+						if imported, exists := file.imports[name]; exists && imported.symbol != "" {
+							middleware = imported.symbol
+						}
+						if !contains(route.Middlewares, middleware) {
+							route.Middlewares = append(route.Middlewares, middleware)
+						}
+					}
+					if symbolID, exists := resolveSymbolID(file.path, name, byName, file.imports, symbols); exists {
+						if !contains(route.DepSymbols, symbolID) {
+							route.DepSymbols = append(route.DepSymbols, symbolID)
+						}
+					}
+				}
+			}
+			break
+		}
+		sort.Strings(route.Middlewares)
+		sort.Strings(route.DepSymbols)
+	}
 }
 
 func isRouteCallCandidate(receiver string, tokens []token, args [][2]int) bool {
@@ -876,84 +1049,145 @@ func indexFunctions(files []sourceFile) map[string][]functionInfo {
 func indexTopLevelSymbols(files []sourceFile) map[string]topLevelSymbol {
 	symbols := make(map[string]topLevelSymbol)
 	for _, file := range files {
+		depth := 0
 		for i := 0; i < len(file.tokens); i++ {
-			if file.tokens[i].text == "const" || file.tokens[i].text == "let" || file.tokens[i].text == "var" {
-				for j := i + 1; j < len(file.tokens); j++ {
-					if file.tokens[j].kind != identifierToken {
-						if file.tokens[j].text == ";" || file.tokens[j].text == "}" {
-							break
-						}
-						continue
-					}
-					if j > i+1 && file.tokens[j-1].text == "," {
-						name := file.tokens[j].text
-						if name == "" || isControlWord(name) {
-							continue
-						}
-						if file.tokens[j+1].text == "=" || file.tokens[j+1].text == "," || file.tokens[j+1].text == ";" {
-							if declarationLooksLikeFunction(file.tokens, j+1) {
-								continue
-							}
-							id := file.path + "\x00" + name
-							symbols[id] = topLevelSymbol{ id: id, file: file.path, name: name, kind: "const",
-								startLine: file.tokens[i].line, endLine: file.tokens[j].line, exported: false, hash: hashTokens(file.tokens, i, j+1)}
-						}
-						continue
-					}
-					if j == i+1 {
-						name := file.tokens[j].text
-						if name == "" || isControlWord(name) {
-							continue
-						}
-						if j+1 < len(file.tokens) && (file.tokens[j+1].text == "=" || file.tokens[j+1].text == "," || file.tokens[j+1].text == ";") {
-							if declarationLooksLikeFunction(file.tokens, j+1) {
-								continue
-							}
-							id := file.path + "\x00" + name
-							symbols[id] = topLevelSymbol{ id: id, file: file.path, name: name, kind: "const",
-								startLine: file.tokens[i].line, endLine: file.tokens[j].line, exported: false, hash: hashTokens(file.tokens, i, j+1)}
-						}
-					}
+			if depth != 0 {
+				if file.tokens[i].text == "{" {
+					depth++
+				} else if file.tokens[i].text == "}" {
+					depth--
 				}
+				continue
 			}
-			if file.tokens[i].text == "type" && i+1 < len(file.tokens) && file.tokens[i+1].kind == identifierToken {
-				name := file.tokens[i+1].text
-				id := file.path + "\x00" + name
-				symbols[id] = topLevelSymbol{id: id, file: file.path, name: name, kind: "type",
-					startLine: file.tokens[i].line, endLine: file.tokens[i+1].line, exported: false, hash: hashTokens(file.tokens, i, i+2)}
-			}
-			if file.tokens[i].text == "interface" && i+1 < len(file.tokens) && file.tokens[i+1].kind == identifierToken {
-				name := file.tokens[i+1].text
-				id := file.path + "\x00" + name
-				symbols[id] = topLevelSymbol{id: id, file: file.path, name: name, kind: "type",
-					startLine: file.tokens[i].line, endLine: file.tokens[i+1].line, exported: false, hash: hashTokens(file.tokens, i, i+2)}
-			}
-			if file.tokens[i].text == "enum" && i+1 < len(file.tokens) && file.tokens[i+1].kind == identifierToken {
-				name := file.tokens[i+1].text
-				id := file.path + "\x00" + name
-				symbols[id] = topLevelSymbol{id: id, file: file.path, name: name, kind: "enum",
-					startLine: file.tokens[i].line, endLine: file.tokens[i+1].line, exported: false, hash: hashTokens(file.tokens, i, i+2)}
-			}
-			if file.tokens[i].text == "export" {
-				if i+2 < len(file.tokens) && file.tokens[i+1].text == "const" && file.tokens[i+2].kind == identifierToken {
-					if declarationLooksLikeFunction(file.tokens, i+2) {
-						continue
-					}
-					name := file.tokens[i+2].text
-					id := file.path + "\x00" + name
-					symbols[id] = topLevelSymbol{id: id, file: file.path, name: name, kind: "const",
-						startLine: file.tokens[i+1].line, endLine: file.tokens[i+2].line, exported: true, hash: hashTokens(file.tokens, i+1, i+3)}
+			tokenIndex, exported := i, i > 0 && file.tokens[i-1].text == "export"
+			switch file.tokens[i].text {
+			case "export":
+				continue
+			case "const", "let", "var":
+				if i+1 >= len(file.tokens) || file.tokens[i+1].kind != identifierToken {
+					continue
 				}
-				if i+2 < len(file.tokens) && file.tokens[i+1].text == "type" && file.tokens[i+2].kind == identifierToken {
-					name := file.tokens[i+2].text
-					id := file.path + "\x00" + name
-					symbols[id] = topLevelSymbol{id: id, file: file.path, name: name, kind: "type",
-						startLine: file.tokens[i+1].line, endLine: file.tokens[i+2].line, exported: true, hash: hashTokens(file.tokens, i+1, i+3)}
+				nameIndex := i + 1
+				end := declarationEnd(file.tokens, i)
+				if end < nameIndex {
+					continue
 				}
+				if declarationValueIsFunction(file.tokens, nameIndex, end) {
+					i = end
+					continue
+				}
+				addTopLevelSymbol(symbols, file, nameIndex, tokenIndex, end, "const", exported)
+				i = end
+				continue
+			case "type", "interface", "enum":
+				if i+1 >= len(file.tokens) || file.tokens[i+1].kind != identifierToken {
+					continue
+				}
+				end := declarationEnd(file.tokens, i)
+				kind := "type"
+				if file.tokens[i].text == "enum" {
+					kind = "enum"
+				}
+				addTopLevelSymbol(symbols, file, i+1, tokenIndex, end, kind, exported)
+				i = end
+				continue
+			}
+			if file.tokens[i].text == "{" {
+				depth++
 			}
 		}
 	}
 	return symbols
+}
+
+func addTopLevelSymbol(symbols map[string]topLevelSymbol, file sourceFile, nameIndex, start, end int,
+	kind string, exported bool) {
+	if nameIndex < 0 || nameIndex >= len(file.tokens) || end < start || end >= len(file.tokens) {
+		return
+	}
+	name := file.tokens[nameIndex].text
+	id := file.path + "\x00" + name
+	symbols[id] = topLevelSymbol{
+		id: id, file: file.path, name: name, kind: kind,
+		startLine: file.tokens[start].line, endLine: file.tokens[end].line,
+		start: start, end: end, exported: exported, hash: hashTokens(file.tokens, start, end+1),
+	}
+}
+
+func declarationEnd(tokens []token, start int) int {
+	paren, bracket, brace := 0, 0, 0
+	for i := start + 1; i < len(tokens); i++ {
+		if paren == 0 && bracket == 0 && brace == 0 && i > start+1 &&
+			tokens[i].line > tokens[i-1].line &&
+			(tokens[i].text == "export" || tokens[i].text == "const" || tokens[i].text == "let" ||
+				tokens[i].text == "var" || tokens[i].text == "type" ||
+				tokens[i].text == "interface" || tokens[i].text == "enum" ||
+				tokens[i].text == "function" || tokens[i].text == "import") {
+			return i - 1
+		}
+		switch tokens[i].text {
+		case "(":
+			paren++
+		case ")":
+			paren--
+		case "[":
+			bracket++
+		case "]":
+			bracket--
+		case "{":
+			brace++
+		case "}":
+			if brace == 0 {
+				return i - 1
+			}
+			brace--
+		case ";":
+			if paren == 0 && bracket == 0 && brace == 0 {
+				return i
+			}
+		}
+	}
+	return len(tokens) - 1
+}
+
+func declarationValueIsFunction(tokens []token, nameIndex, end int) bool {
+	equal := nameIndex + 1
+	for equal <= end && tokens[equal].text != "=" {
+		equal++
+	}
+	if equal > end || equal+1 > end {
+		return false
+	}
+	if tokens[equal+1].text == "function" || tokens[equal+1].text == "async" &&
+		equal+2 <= end && tokens[equal+2].text == "function" {
+		return true
+	}
+	paren, bracket, brace := 0, 0, 0
+	for i := equal + 1; i <= end; i++ {
+		switch tokens[i].text {
+		case "(":
+			paren++
+		case ")":
+			paren--
+		case "[":
+			bracket++
+		case "]":
+			bracket--
+		case "{":
+			brace++
+		case "}":
+			brace--
+		case "=>":
+			if paren == 0 && bracket == 0 && brace == 0 {
+				return true
+			}
+		case ",":
+			if paren == 0 && bracket == 0 && brace == 0 {
+				return false
+			}
+		}
+	}
+	return false
 }
 
 func indexSymbolReferences(files []sourceFile, symbols map[string]topLevelSymbol) (map[string]map[string]bool, map[string]map[string]bool, map[string]map[string]bool) {
@@ -961,44 +1195,13 @@ func indexSymbolReferences(files []sourceFile, symbols map[string]topLevelSymbol
 	graphUses := make(map[string]map[string]bool)
 	graphUsedBy := make(map[string]map[string]bool)
 	byName := make(map[string]map[string]bool)
-	for _, file := range files {
-		for _, symbol := range symbols {
-			if symbol.file == file.path {
-				if byName[file.path] == nil {
-					byName[file.path] = make(map[string]bool)
-				}
-				byName[file.path][symbol.name] = true
-			}
+	for _, symbol := range symbols {
+		if byName[symbol.file] == nil {
+			byName[symbol.file] = make(map[string]bool)
 		}
+		byName[symbol.file][symbol.name] = true
 	}
 	for _, file := range files {
-		for i := 0; i+1 < len(file.tokens); i++ {
-			if file.tokens[i].kind != identifierToken || file.tokens[i+1].text != "(" {
-				continue
-			}
-			name := file.tokens[i].text
-			if isControlWord(name) || name == "" {
-				continue
-			}
-			close := matchingToken(file.tokens, i+1, "(", ")")
-			if close < 0 {
-				continue
-			}
-			args := splitArguments(file.tokens, i+2, close)
-			for _, arg := range args {
-				for j := arg[0]; j < arg[1]; j++ {
-					if file.tokens[j].kind != identifierToken {
-						continue
-					}
-					candidate := file.tokens[j].text
-					if symbolID, ok := resolveSymbolID(file.path, candidate, byName, file.imports, symbols); ok {
-						addGraphEdge(graphConsumers, symbolID, "function:"+name)
-						addGraphEdge(graphUses, symbolID, "function:"+name)
-						addGraphEdge(graphUsedBy, "function:"+name, symbolID)
-					}
-				}
-			}
-		}
 		for i := 0; i < len(file.tokens); i++ {
 			if file.tokens[i].text != "function" && file.tokens[i].text != "const" && file.tokens[i].text != "let" &&
 				file.tokens[i].text != "var" && file.tokens[i].text != "=>" {
@@ -1008,12 +1211,26 @@ func indexSymbolReferences(files []sourceFile, symbols map[string]topLevelSymbol
 			if !ok {
 				continue
 			}
+			for j := i; j < start; j++ {
+				if j == i || file.tokens[j-1].text != ":" ||
+					file.tokens[j].kind != identifierToken {
+					continue
+				}
+				if symbolID, ok := resolveSymbolID(file.path, file.tokens[j].text, byName, file.imports, symbols); ok {
+					addGraphEdge(graphConsumers, symbolID, "function:"+name)
+					addGraphEdge(graphUses, symbolID, "function:"+name)
+					addGraphEdge(graphUsedBy, "function:"+name, symbolID)
+				}
+			}
 			for j := start; j < end; j++ {
 				if file.tokens[j].kind != identifierToken {
 					continue
 				}
 				candidate := file.tokens[j].text
 				if candidate == "" || isControlWord(candidate) || candidate == name {
+					continue
+				}
+				if symbolIsShadowed(file, j, candidate) {
 					continue
 				}
 				if symbolID, ok := resolveSymbolID(file.path, candidate, byName, file.imports, symbols); ok {
@@ -1023,8 +1240,89 @@ func indexSymbolReferences(files []sourceFile, symbols map[string]topLevelSymbol
 				}
 			}
 		}
+		for _, symbol := range symbols {
+			if symbol.file != file.path {
+				continue
+			}
+			for tokenIndex := symbol.start; tokenIndex <= symbol.end && tokenIndex < len(file.tokens); tokenIndex++ {
+				if file.tokens[tokenIndex].kind != identifierToken || file.tokens[tokenIndex].text == symbol.name {
+					continue
+				}
+				dependency, ok := resolveSymbolID(file.path, file.tokens[tokenIndex].text,
+					byName, file.imports, symbols)
+				if !ok || dependency == symbol.id {
+					continue
+				}
+				addGraphEdge(graphConsumers, dependency, "symbol:"+symbol.id)
+				addGraphEdge(graphUses, dependency, "symbol:"+symbol.id)
+				addGraphEdge(graphUsedBy, "symbol:"+symbol.id, dependency)
+			}
+		}
 	}
 	return graphConsumers, graphUses, graphUsedBy
+}
+
+func symbolIsShadowed(file sourceFile, index int, name string) bool {
+	for scope := 0; scope < len(file.tokens); scope++ {
+		if file.tokens[scope].text != "function" && file.tokens[scope].text != "const" &&
+			file.tokens[scope].text != "let" && file.tokens[scope].text != "var" &&
+			file.tokens[scope].text != "=>" {
+			continue
+		}
+		_, start, end, ok := functionRangeForFile(file, scope)
+		if !ok || index < start || index >= end {
+			continue
+		}
+		if functionHasParameter(file.tokens, scope, start, name) {
+			return true
+		}
+		for i := start; i+1 < end; i++ {
+			if (file.tokens[i].text == "const" || file.tokens[i].text == "let" ||
+				file.tokens[i].text == "var" || file.tokens[i].text == "class") &&
+				file.tokens[i+1].text == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func functionHasParameter(tokens []token, functionIndex, bodyStart int, name string) bool {
+	for close := bodyStart - 2; close > functionIndex; close-- {
+		if tokens[close].text == ")" {
+			open := close
+			depth := 1
+			for open > functionIndex+1 {
+				open--
+				if tokens[open].text == ")" {
+					depth++
+				} else if tokens[open].text == "(" {
+					depth--
+					if depth == 0 {
+						break
+					}
+				}
+			}
+			if depth != 0 {
+				return false
+			}
+			for _, parameter := range splitArguments(tokens, open+1, close) {
+				for i := parameter[0]; i < parameter[1]; i++ {
+					if tokens[i].kind == identifierToken && tokens[i].text == name {
+						return true
+					}
+					if tokens[i].text == ":" || tokens[i].text == "=" {
+						break
+					}
+				}
+			}
+			return false
+		}
+		if tokens[close].text == "{" || tokens[close].text == ";" {
+			break
+		}
+	}
+	return false
 }
 
 func resolveSymbolID(filePath, name string, byName map[string]map[string]bool,
@@ -1052,6 +1350,47 @@ func addGraphEdge(edges map[string]map[string]bool, from, to string) {
 	edges[from][to] = true
 }
 
+func routesImportingFile(routes []Route, files []sourceFile, target string) []Route {
+	dependencies := make(map[string][]string, len(files))
+	for _, file := range files {
+		dependencies[file.path] = append(dependencies[file.path], file.modules...)
+		for _, imported := range file.imports {
+			if imported.file != "" {
+				dependencies[file.path] = append(dependencies[file.path], imported.file)
+			}
+		}
+	}
+	result := make([]Route, 0)
+	for _, route := range routes {
+		if route.File == target {
+			result = append(result, route)
+			continue
+		}
+		visited := make(map[string]bool)
+		queue := []string{route.File}
+		found := false
+		for len(queue) > 0 && !found {
+			current := queue[0]
+			queue = queue[1:]
+			if visited[current] {
+				continue
+			}
+			visited[current] = true
+			for _, dependency := range dependencies[current] {
+				if dependency == target {
+					found = true
+					break
+				}
+				queue = append(queue, dependency)
+			}
+		}
+		if found {
+			result = append(result, route)
+		}
+	}
+	return result
+}
+
 func functionRangeForFile(file sourceFile, index int) (string, int, int, bool) {
 	if file.tokens[index].text == "function" {
 		if index+1 >= len(file.tokens) || file.tokens[index+1].kind != identifierToken {
@@ -1069,7 +1408,7 @@ func functionRangeForFile(file sourceFile, index int) (string, int, int, bool) {
 		if bodyEnd < 0 {
 			return "", 0, 0, false
 		}
-		return name, bodyStart+1, bodyEnd, true
+		return name, bodyStart + 1, bodyEnd, true
 	}
 	if file.tokens[index].text == "const" || file.tokens[index].text == "let" || file.tokens[index].text == "var" {
 		if index+1 >= len(file.tokens) || file.tokens[index+1].kind != identifierToken {
@@ -1090,7 +1429,7 @@ func functionRangeForFile(file sourceFile, index int) (string, int, int, bool) {
 		if bodyEnd >= len(file.tokens) {
 			return "", 0, 0, false
 		}
-		return name, bodyStart+1, bodyEnd, true
+		return name, bodyStart + 1, bodyEnd, true
 	}
 	return "", 0, 0, false
 }
@@ -1157,7 +1496,11 @@ func findRoutesForTopLevelSymbol(symbolID string, routes []Route, files []source
 		}
 		seen[id] = true
 		for consumer := range symbolConsumers[id] {
-			functions[consumer] = true
+			if strings.HasPrefix(consumer, "symbol:") {
+				current = append(current, strings.TrimPrefix(consumer, "symbol:"))
+			} else {
+				functions[consumer] = true
+			}
 		}
 		for dep := range symbolUses[id] {
 			current = append(current, dep)
@@ -1166,20 +1509,41 @@ func findRoutesForTopLevelSymbol(symbolID string, routes []Route, files []source
 			current = append(current, dep)
 		}
 	}
-	if len(functions) == 0 {
-		return nil
-	}
 	impacts := make([]RouteImpact, 0)
 	for _, route := range routes {
+		dependsOnSymbol := false
+		for _, dependency := range route.DepSymbols {
+			if seen[dependency] {
+				dependsOnSymbol = true
+				break
+			}
+		}
 		for _, handler := range route.Handlers {
 			consumerKey := "function:" + handler
-			if handler == symbols[symbolID].name || functions[consumerKey] {
+			if dependsOnSymbol || handler == symbols[symbolID].name || functions[consumerKey] {
+				chain := []string{symbols[symbolID].name}
+				if len(route.Middlewares) > 0 {
+					chain = append(chain, route.Middlewares[0])
+				} else if handler != symbols[symbolID].name {
+					chain = append(chain, handler)
+				}
+				chain = append(chain, route.Method+" "+route.Path)
+				confidence, severity := "exact", "potential"
+				reason := "top-level symbol changed and is used by a route dependency"
+				if symbols[symbolID].kind == "type" || symbols[symbolID].kind == "enum" {
+					confidence, severity = "uncertain", "uncertain"
+					reason = "changed type contract could not be fully resolved"
+				} else if topLevelSymbolIsZodSchema(symbols[symbolID], files) &&
+					!routeUsesValidationMiddleware(route) {
+					confidence, severity = "heuristic", "body-changed"
+					reason = "schema direction unknown - review"
+				}
 				impacts = append(impacts, RouteImpact{
 					Route:      route,
-					Chain:      []string{symbols[symbolID].name, handler},
-					Reason:     "top-level symbol changed and is used by the route handler",
-					Confidence: "exact",
-					Severity:   "potential",
+					Chain:      chain,
+					Reason:     reason,
+					Confidence: confidence,
+					Severity:   severity,
 					Symbol:     symbols[symbolID].name,
 				})
 				break
@@ -1187,6 +1551,21 @@ func findRoutesForTopLevelSymbol(symbolID string, routes []Route, files []source
 		}
 	}
 	return impacts
+}
+
+func topLevelSymbolIsZodSchema(symbol topLevelSymbol, files []sourceFile) bool {
+	for _, file := range files {
+		if file.path != symbol.file {
+			continue
+		}
+		for i := symbol.start; i+2 <= symbol.end && i+2 < len(file.tokens); i++ {
+			if file.tokens[i].text == "z" && file.tokens[i+1].text == "." &&
+				file.tokens[i+2].text == "object" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func arrowName(tokens []token, arrow int) (int, int, bool) {
@@ -1307,22 +1686,41 @@ func importsByFile(files []sourceFile) map[string]map[string]importedSymbol {
 }
 
 func affectedRoutes(routes []Route, changes []diff.File, functions map[string][]functionInfo,
-	fileImports map[string]map[string]importedSymbol, files []sourceFile) []RouteImpact {
+	fileImports map[string]map[string]importedSymbol, files []sourceFile) ([]RouteImpact, []Warning) {
 	impacts := make([]RouteImpact, 0)
+	warnings := make([]Warning, 0)
 	added := make(map[string]bool)
 	schemas := indexContractSchemas(files)
 	routeContracts := indexRouteContracts(routes, files, schemas)
 	symbols := indexTopLevelSymbols(files)
 	symbolConsumers, symbolUses, symbolUsedBy := indexSymbolReferences(files, symbols)
 	for _, fileChange := range changes {
+		if !isSourceFile(fileChange.Path) {
+			continue
+		}
 		if isCosmetic(fileChange) {
 			continue
 		}
 		contractResult := routeContractChanges(routes, routeContracts, schemas, fileChange)
 		for _, finding := range contractResult.findings {
+			var chain []string
+			for _, dependency := range finding.route.DepSymbols {
+				file, name, ok := splitSchemaKey(dependency)
+				if ok && file == fileChange.Path {
+					chain = append(chain, name)
+					break
+				}
+			}
+			chain = append(chain, finding.route.Middlewares...)
+			chain = append(chain, finding.route.Method+" "+finding.route.Path)
+			confidence := "exact"
+			if strings.Contains(finding.reason, "constraint tightened") ||
+				strings.Contains(finding.reason, "schema logic changed") {
+				confidence = "heuristic"
+			}
 			impacts = append(impacts, RouteImpact{
-				Route: finding.route, Chain: append([]string(nil), finding.route.Handlers...),
-				Reason: finding.reason, Confidence: "heuristic",
+				Route: finding.route, Chain: chain,
+				Reason: finding.reason, Confidence: confidence,
 				Severity: finding.severity,
 			})
 			added[routeKey(finding.route)] = true
@@ -1337,8 +1735,19 @@ func affectedRoutes(routes []Route, changes []diff.File, functions map[string][]
 					}
 				}
 			}
-			if len(changedSymbols) > 0 {
-				continue
+		}
+		symbolChangedLines := make(map[int]bool)
+		for changeIndex, change := range fileChange.Changes {
+			line := change.NewLine
+			if change.Kind == diff.DeletedChange {
+				line = change.OldLine
+			}
+			for _, symbolID := range changedSymbols {
+				symbol := symbols[symbolID]
+				if line >= symbol.startLine && line <= symbol.endLine {
+					symbolChangedLines[changeIndex] = true
+					break
+				}
 			}
 		}
 		changedNames := make(map[string]bool)
@@ -1347,9 +1756,15 @@ func affectedRoutes(routes []Route, changes []diff.File, functions map[string][]
 		oldSignatures := make(map[string]functionSignature)
 		newSignatures := make(map[string]functionSignature)
 		directRoutes := make(map[int]bool)
-		moduleLevel := fileChange.Status == diff.Deleted
+		untracedChanges := make([]diff.Change, 0)
+		if fileChange.Status == diff.Deleted && len(fileChange.Changes) == 0 {
+			untracedChanges = append(untracedChanges, diff.Change{Kind: diff.DeletedChange, OldLine: 1})
+		}
 		for changeIndex, change := range fileChange.Changes {
 			if contractResult.handledChanges[changeIndex] {
+				continue
+			}
+			if symbolChangedLines[changeIndex] {
 				continue
 			}
 			if signature, ok := parseFunctionSignature(change.Text); ok {
@@ -1377,7 +1792,7 @@ func affectedRoutes(routes []Route, changes []diff.File, functions map[string][]
 					}
 				}
 				if !matched {
-					moduleLevel = true
+					untracedChanges = append(untracedChanges, change)
 				}
 			} else {
 				matched := false
@@ -1409,7 +1824,7 @@ func affectedRoutes(routes []Route, changes []diff.File, functions map[string][]
 					matched = true
 				}
 				if !matched {
-					moduleLevel = true
+					untracedChanges = append(untracedChanges, change)
 				}
 			}
 		}
@@ -1443,17 +1858,26 @@ func affectedRoutes(routes []Route, changes []diff.File, functions map[string][]
 			return sortedChangedNames[i] < sortedChangedNames[j]
 		})
 
-		for _, route := range routes {
-			if moduleLevel {
-				key := routeKey(route)
-				if !added[key] {
-					impacts = append(impacts, RouteImpact{
-						Route: route, Reason: "change could not be assigned to a function; all routes are flagged",
-						Confidence: "uncertain", Severity: "uncertain",
-					})
-					added[key] = true
-				}
+		for _, change := range untracedChanges {
+			line := change.NewLine
+			if change.Kind == diff.DeletedChange {
+				line = change.OldLine
 			}
+			warnings = append(warnings, Warning{
+				File: fileChange.Path, Line: line, Message: "change could not be traced",
+			})
+		}
+		for _, route := range routesImportingFile(routes, files, fileChange.Path) {
+			key := routeKey(route)
+			if len(untracedChanges) > 0 && !added[key] {
+				impacts = append(impacts, RouteImpact{
+					Route: route, Reason: "unattributed module-level change in an imported file",
+					Confidence: "uncertain", Severity: "uncertain",
+				})
+				added[key] = true
+			}
+		}
+		for _, route := range routes {
 			if directRoutes[route.Line] && route.File == fileChange.Path && !added[routeKey(route)] {
 				impacts = append(impacts, RouteImpact{
 					Route: route, Reason: "route declaration was added or changed",
@@ -1523,7 +1947,7 @@ func affectedRoutes(routes []Route, changes []diff.File, functions map[string][]
 		}
 		return a.Path < b.Path
 	})
-	return impacts
+	return impacts, warnings
 }
 
 func signatureCallSites(name string, signature functionSignature,

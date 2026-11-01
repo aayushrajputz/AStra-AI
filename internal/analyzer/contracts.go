@@ -16,6 +16,9 @@ type contractField struct {
 	typeName string
 	optional bool
 	column   int
+	line        int
+	constraints string
+	enumValues  string
 }
 
 type contractSchema struct {
@@ -24,6 +27,7 @@ type contractSchema struct {
 	startLine int
 	endLine   int
 	fields    map[string]contractField
+	review    bool
 }
 
 type contractReference struct {
@@ -131,10 +135,12 @@ func indexContractSchemas(files []sourceFile) map[string]contractSchema {
 			if name == "" {
 				continue
 			}
+			expressionEnd := declarationEnd(tokens, i)
 			schemas[file.path+"\x00"+name] = contractSchema{
 				name: name, file: file.path,
-				startLine: tokens[i+2].line, endLine: tokens[closeObject].line,
+				startLine: tokens[i+2].line, endLine: tokens[expressionEnd].line,
 				fields: parseContractFields(tokens, i+3, closeObject, true),
+				review: zodSchemaNeedsReview(tokens, i, expressionEnd),
 			}
 		}
 		for _, declaration := range file.goFileDeclarations() {
@@ -218,6 +224,21 @@ func indexContractSchemas(files []sourceFile) map[string]contractSchema {
 	return schemas
 }
 
+func zodSchemaNeedsReview(tokens []token, start, end int) bool {
+	for i := start; i < end; i++ {
+		if tokens[i].text == "..." {
+			return true
+		}
+		if tokens[i].text == "." && i+1 < end {
+			switch tokens[i+1].text {
+			case "refine", "transform", "superRefine", "pick", "omit", "extend", "merge":
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (file sourceFile) goFileDeclarations() []ast.Decl {
 	if file.goFile == nil {
 		return nil
@@ -267,10 +288,14 @@ func assignedName(tokens []token, index int) string {
 }
 
 func parseContractFields(tokens []token, start, end int, zod bool) map[string]contractField {
+	return parseContractFieldsWithPrefix(tokens, start, end, zod, "")
+}
+
+func parseContractFieldsWithPrefix(tokens []token, start, end int, zod bool, prefix string) map[string]contractField {
 	fields := make(map[string]contractField)
 	for _, member := range splitContractMembers(tokens, start, end) {
 		colon := -1
-		field := contractField{}
+		field := contractField{line: tokens[member[0]].line}
 		for i := member[0]; i < member[1]; i++ {
 			if tokens[i].text == ":" {
 				colon = i
@@ -287,6 +312,7 @@ func parseContractFields(tokens []token, start, end int, zod bool) map[string]co
 		if colon < 0 || field.name == "" {
 			continue
 		}
+		field.name = prefix + field.name
 		for i := colon + 1; i < member[1]; i++ {
 			field.typeName += tokens[i].text
 			if tokens[i].text == "?" && i+1 < member[1] && tokens[i+1].text == "." &&
@@ -296,12 +322,88 @@ func parseContractFields(tokens []token, start, end int, zod bool) map[string]co
 		}
 		if zod {
 			field.typeName = zodFieldType(tokens, colon+1, member[1])
+			field.optional = field.optional || zodOptional(tokens, colon+1, member[1])
+			field.constraints = zodConstraintSignature(tokens, colon+1, member[1])
+			field.enumValues = zodEnumValues(tokens, colon+1, member[1])
+			for i := colon + 1; i+2 < member[1]; i++ {
+				if tokens[i].text != "z" || tokens[i+1].text != "." ||
+					tokens[i+2].text != "object" {
+					continue
+		}
+				open := i + 3
+				for open < member[1] && tokens[open].text != "{" {
+					open++
+				}
+				if open >= member[1] {
+					continue
+				}
+				close := matchingToken(tokens, open, "{", "}")
+				if close < 0 || close > member[1] {
+					continue
+				}
+				nested := parseContractFieldsWithPrefix(tokens, open+1, close, true, field.name+".")
+				for name, child := range nested {
+					fields[name] = child
+				}
+				break
+			}
 		}
 		if field.name != "" && field.typeName != "" {
 			fields[field.name] = field
 		}
 	}
 	return fields
+}
+
+func zodOptional(tokens []token, start, end int) bool {
+	for i := start; i+1 < end; i++ {
+		if tokens[i].text == "." && (tokens[i+1].text == "optional" ||
+			tokens[i+1].text == "nullish" || tokens[i+1].text == "default") {
+			return true
+		}
+	}
+	return false
+}
+
+func zodConstraintSignature(tokens []token, start, end int) string {
+	var constraints []string
+	for i := start; i+1 < end; i++ {
+		if tokens[i].text == "." && (tokens[i+1].text == "min" || tokens[i+1].text == "max" ||
+			tokens[i+1].text == "email" || tokens[i+1].text == "regex" || tokens[i+1].text == "length") {
+			constraints = append(constraints, tokens[i+1].text)
+		}
+	}
+	sort.Strings(constraints)
+	return strings.Join(constraints, ",")
+}
+
+func zodEnumValues(tokens []token, start, end int) string {
+	for i := start; i+3 < end; i++ {
+		if tokens[i].text != "z" || tokens[i+1].text != "." ||
+			tokens[i+2].text != "enum" || tokens[i+3].text != "(" {
+			continue
+		}
+		open := i + 4
+		for open < end && tokens[open].text != "[" {
+			open++
+		}
+		if open >= end {
+			return ""
+		}
+		close := matchingToken(tokens, open, "[", "]")
+		if close < 0 || close > end {
+			return ""
+		}
+		var values []string
+		for index := open + 1; index < close; index++ {
+			if tokens[index].kind == stringToken {
+				values = append(values, strings.Trim(tokens[index].text, `"'`))
+			}
+		}
+		sort.Strings(values)
+		return strings.Join(values, ",")
+	}
+	return ""
 }
 
 func splitContractMembers(tokens []token, start, end int) [][2]int {
@@ -334,16 +436,15 @@ func zodFieldType(tokens []token, start, end int) string {
 			continue
 		}
 		base := ""
-		expectedExpression := ""
 		switch tokens[i+2].text {
 		case "string":
-			base, expectedExpression = "string", "z.string()"
+			base = "string"
 		case "number":
-			base, expectedExpression = "number", "z.number()"
+			base = "number"
 		case "boolean":
-			base, expectedExpression = "boolean", "z.boolean()"
+			base = "boolean"
 		case "date":
-			base, expectedExpression = "Date", "z.date()"
+			base = "Date"
 		case "array":
 			for j := i + 3; j+2 < end; j++ {
 				if tokens[j].text != "z" || tokens[j+1].text != "." {
@@ -353,25 +454,28 @@ func zodFieldType(tokens []token, start, end int) string {
 				case "string", "number", "boolean", "date":
 					elementType := zodPrimitiveType(tokens[j+2].text)
 					base = "array<" + elementType + ">"
-					expectedExpression = "z.array(z." + strings.ToLower(elementType) + "())"
 				}
 				if base != "" {
 					break
 				}
 			}
 		case "object":
-			base, expectedExpression = "object", "z.object()"
-		case "enum", "literal", "union", "record", "tuple":
-			return "zod:" + normalizedZodExpression(tokens, start, end)
+			base = "object"
+		case "enum":
+			return "enum"
+		case "literal":
+			return "literal"
+		case "union":
+			return "union"
+		case "record":
+			return "record"
+		case "tuple":
+			return "tuple"
 		}
 		if base != "" {
-			expression := normalizedZodExpression(tokens, start, end)
-			if expression == expectedExpression {
 				return base
 			}
-			return base + "|" + expression
 		}
-	}
 	return "zod:" + normalizedZodExpression(tokens, start, end)
 }
 
@@ -480,9 +584,20 @@ func parseClassContractFields(tokens []token, start, end int) map[string]contrac
 
 func indexRouteContracts(routes []Route, files []sourceFile, schemas map[string]contractSchema) map[string]routeContract {
 	fileByPath := make(map[string]sourceFile, len(files))
+	symbols := indexTopLevelSymbols(files)
+	byName := make(map[string]map[string]bool)
 	for _, file := range files {
 		fileByPath[file.path] = file
+		for _, symbol := range symbols {
+			if symbol.file == file.path {
+				if byName[file.path] == nil {
+					byName[file.path] = make(map[string]bool)
 	}
+				byName[file.path][symbol.name] = true
+			}
+		}
+	}
+	functions := indexFunctions(files)
 	bindings := make(map[string]routeContract)
 	for _, route := range routes {
 		file, ok := fileByPath[route.File]
@@ -503,10 +618,90 @@ func indexRouteContracts(routes []Route, files []sourceFile, schemas map[string]
 			if name := findSchemaReference(responseType, file, schemas); name != "" {
 				binding.response = appendUniqueContractRef(binding.response, resolveSchemaReference(name, file, schemas))
 			}
+			targetName, targetFile := handler, file
+			if imported, exists := file.imports[handler]; exists {
+				targetName = imported.symbol
+				targetFile = fileByPath[imported.file]
+		}
+			for _, definition := range functions[targetName] {
+				if definition.file != targetFile.path || !functionUsesRequestParser(definition, fileByPath, byName, symbols, schemas) {
+					continue
+				}
+				targetSource := fileByPath[definition.file]
+				for index := definition.bodyStart; index < definition.bodyEnd; index++ {
+					if targetSource.tokens[index].kind != identifierToken {
+						continue
+					}
+					schemaID, ok := resolveSymbolID(definition.file, targetSource.tokens[index].text,
+						byName, definition.imports, symbols)
+					if !ok {
+						continue
+					}
+					if _, exists := schemas[schemaID]; exists {
+						schemaFile, schemaName, _ := splitSchemaKey(schemaID)
+						binding.request = appendUniqueContractRef(binding.request, contractReference{
+							name: schemaName, file: schemaFile,
+						})
+					}
+				}
+			}
+		}
+		for _, dependency := range route.DepSymbols {
+			file, name, ok := splitSchemaKey(dependency)
+			if !ok {
+				continue
+			}
+			if _, exists := schemas[dependency]; exists && routeUsesValidationMiddleware(route) {
+				binding.request = appendUniqueContractRef(binding.request, contractReference{
+					name: name, file: file,
+				})
+			}
 		}
 		bindings[routeKey(route)] = binding
 	}
 	return bindings
+}
+
+func functionUsesRequestParser(definition functionInfo, files map[string]sourceFile,
+	byName map[string]map[string]bool, symbols map[string]topLevelSymbol,
+	schemas map[string]contractSchema) bool {
+	file, exists := files[definition.file]
+	if !exists {
+		return false
+	}
+	hasParser, hasRequest := false, false
+	for index := definition.bodyStart; index < definition.bodyEnd; index++ {
+		switch file.tokens[index].text {
+		case "parse", "safeParse":
+			hasParser = true
+		case "req", "request":
+			hasRequest = true
+		}
+	}
+	if !hasParser || !hasRequest {
+		return false
+	}
+	for index := definition.bodyStart; index < definition.bodyEnd; index++ {
+		if file.tokens[index].kind != identifierToken {
+			continue
+		}
+		if symbolID, ok := resolveSymbolID(definition.file, file.tokens[index].text,
+			byName, definition.imports, symbols); ok {
+			if _, isSchema := schemas[symbolID]; isSchema {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func routeUsesValidationMiddleware(route Route) bool {
+	for _, middleware := range route.Middlewares {
+		if strings.Contains(strings.ToLower(middleware), "validat") {
+			return true
+		}
+	}
+	return false
 }
 
 func goHandlerRequestSchemas(handler string, routeFile sourceFile, files map[string]sourceFile,
@@ -838,21 +1033,37 @@ func changedContractField(source string) (contractField, bool) {
 		if colon >= len(tokens) || tokens[colon].text != ":" {
 			continue
 		}
-		end := colon + 1
-		for end < len(tokens) && tokens[end].text != ";" && tokens[end].text != "," &&
-			tokens[end].text != "=" {
+		end, depth := colon+1, 0
+		for end < len(tokens) {
+			switch tokens[end].text {
+			case "(", "[", "{":
+				depth++
+			case ")", "]", "}":
+				depth--
+			case ";", "=":
+				if depth == 0 {
+					goto expressionDone
+				}
+			case ",":
+				if depth == 0 {
+					goto expressionDone
+				}
+			}
 			if tokens[end].text == "." && end+1 < len(tokens) && tokens[end+1].text == "optional" {
 				field.optional = true
 			}
 			field.typeName += tokens[end].text
 			end++
 		}
+	expressionDone:
 		if field.typeName == "" {
 			return contractField{}, false
 		}
 		if strings.Contains(field.typeName, "z.") {
 			field.typeName = changedZodType(field.typeName)
 			field.optional = field.optional || strings.Contains(source, ".optional")
+			field.constraints = zodConstraintSignature(tokens, colon+1, end)
+			field.enumValues = zodEnumValues(tokens, colon+1, end)
 		}
 		return field, true
 	}
@@ -914,6 +1125,27 @@ func classifyContractChanges(route Route, binding routeContract, schemas map[str
 		{label: "request", references: binding.request},
 		{label: "response", references: binding.response},
 	}
+	for _, direction := range directions {
+		for _, reference := range direction.references {
+			if reference.file != change.Path {
+				continue
+			}
+			schema, exists := schemas[reference.file+"\x00"+reference.name]
+			if !exists || !schema.review {
+				continue
+			}
+			for index, changed := range change.Changes {
+				if result.handledChanges[index] || !schemaContainsChangeLine(schema, changed, changed.Kind == diff.AddedChange) {
+					continue
+				}
+				result.findings = append(result.findings, contractFinding{
+					route: route, severity: "body-changed",
+					reason: "schema logic changed - review",
+				})
+				result.handledChanges[index] = true
+			}
+		}
+	}
 	for index, oldField := range oldFields {
 		for newIndex, newField := range newFields {
 			if oldField.name != newField.name {
@@ -934,9 +1166,12 @@ func classifyContractChanges(route Route, binding routeContract, schemas map[str
 					if !schemaContainsChangeLine(schema, change.Changes[newIndex], true) {
 						continue
 					}
-					if _, fieldExists := schema.fields[oldField.name]; !fieldExists {
+					current, fieldExists := schemaFieldForChange(schema, newField, change.Changes[newIndex], true)
+					if !fieldExists || current.name != schemaFieldNameForChange(schema, oldField, change.Changes[index], false) {
 						continue
 					}
+					oldField.name = current.name
+					newField.name = current.name
 					severity, reason := classifyChangedContractField(direction.label, oldField, newField)
 					if severity != "" {
 						result.findings = append(result.findings, contractFinding{
@@ -965,7 +1200,7 @@ func classifyContractChanges(route Route, binding routeContract, schemas map[str
 				if !schemaContainsChangeLine(schema, change.Changes[index], false) {
 					continue
 				}
-				if _, exists := schema.fields[oldField.name]; exists {
+				if _, exists := schemaFieldForChange(schema, oldField, change.Changes[index], false); exists {
 					continue
 				}
 				matchesTopLevelColumn := len(schema.fields) == 0
@@ -980,7 +1215,8 @@ func classifyContractChanges(route Route, binding routeContract, schemas map[str
 				}
 				result.findings = append(result.findings, contractFinding{
 					route: route, severity: "breaking",
-					reason: fmt.Sprintf("%s field %q was removed", direction.label, oldField.name),
+					reason: fmt.Sprintf("%s field %q was removed", direction.label,
+						nestedContractFieldName(schema, oldField, change.Changes[index])),
 				})
 				result.handledChanges[index] = true
 			}
@@ -1002,10 +1238,11 @@ func classifyContractChanges(route Route, binding routeContract, schemas map[str
 				if !schemaContainsChangeLine(schema, change.Changes[index], true) {
 					continue
 				}
-				current, exists := schema.fields[newField.name]
+				current, exists := schemaFieldForChange(schema, newField, change.Changes[index], true)
 				if !exists || current.typeName != newField.typeName {
 					continue
 				}
+				newField.name = current.name
 				severity := "non-breaking"
 				reason := fmt.Sprintf("%s field %q was added", direction.label, newField.name)
 				if direction.label == "request" && !current.optional {
@@ -1024,10 +1261,77 @@ func classifyContractChanges(route Route, binding routeContract, schemas map[str
 	return result
 }
 
+func nestedContractFieldName(schema contractSchema, field contractField, change diff.Change) string {
+	parent := contractField{}
+	for _, candidate := range schema.fields {
+		if strings.Contains(candidate.name, ".") || candidate.column >= field.column ||
+			candidate.line >= change.OldLine || candidate.line < parent.line {
+			continue
+		}
+		parent = candidate
+	}
+	if parent.name != "" {
+		return parent.name + "." + field.name
+	}
+	return field.name
+}
+
+func schemaFieldForChange(schema contractSchema, field contractField, change diff.Change, added bool) (contractField, bool) {
+	line := change.OldLine
+	if added {
+		line = change.NewLine
+	}
+	if current, ok := schema.fields[field.name]; ok && (line <= 0 || current.line == 0 || current.line == line) {
+		return current, true
+	}
+	for _, current := range schema.fields {
+		if strings.HasSuffix(current.name, "."+field.name) &&
+			(line <= 0 || current.line == 0 || current.line == line) {
+			return current, true
+		}
+	}
+	return contractField{}, false
+}
+
+func schemaFieldNameForChange(schema contractSchema, field contractField, change diff.Change, added bool) string {
+	current, ok := schemaFieldForChange(schema, field, change, added)
+	if !ok {
+		return ""
+	}
+	return current.name
+}
+
 func classifyChangedContractField(direction string, oldField, newField contractField) (string, string) {
 	if oldField.typeName != newField.typeName {
 		return "breaking", fmt.Sprintf("%s field %q changed type from %s to %s",
 			direction, oldField.name, oldField.typeName, newField.typeName)
+	}
+	if oldField.enumValues != newField.enumValues &&
+		(oldField.typeName == "enum" || newField.typeName == "enum") {
+		newValues := make(map[string]bool)
+		for _, value := range strings.Split(newField.enumValues, ",") {
+			newValues[value] = value != ""
+		}
+		for _, value := range strings.Split(oldField.enumValues, ",") {
+			if value != "" && !newValues[value] {
+				return "breaking", fmt.Sprintf("%s field %q enum value %q was removed",
+					direction, oldField.name, value)
+			}
+		}
+		return "non-breaking", fmt.Sprintf("%s field %q enum value added", direction, oldField.name)
+	}
+	if oldField.constraints != newField.constraints {
+		oldConstraints := make(map[string]bool)
+		for _, constraint := range strings.Split(oldField.constraints, ",") {
+			oldConstraints[constraint] = constraint != ""
+		}
+		for _, constraint := range strings.Split(newField.constraints, ",") {
+			if constraint != "" && !oldConstraints[constraint] {
+				return "breaking", fmt.Sprintf("%s field %q constraint tightened (%s added)",
+					direction, oldField.name, constraint)
+			}
+		}
+		return "non-breaking", fmt.Sprintf("%s field %q constraint removed", direction, oldField.name)
 	}
 	if oldField.optional == newField.optional {
 		return "", ""
