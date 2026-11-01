@@ -30,6 +30,7 @@ type corpusCase struct {
 	ID              string   `json:"id"`
 	Description     string   `json:"description"`
 	Directory       string   `json:"directory"`
+	GoModule        string   `json:"go_module,omitempty"`
 	BreakingRoutes  []string `json:"breaking_routes"`
 	KnownRoutes     []string `json:"known_routes"`
 	UncertainRoutes []string `json:"uncertain_routes,omitempty"`
@@ -108,6 +109,11 @@ func runCase(testCase corpusCase) (Metrics, int, string, error) {
 	after, err := readTree(afterDir)
 	if err != nil {
 		return Metrics{}, 0, "", err
+	}
+	if testCase.GoModule != "" {
+		moduleFile := []byte("module " + testCase.GoModule + "\n\ngo 1.24\n")
+		before["go.mod"] = moduleFile
+		after["go.mod"] = moduleFile
 	}
 
 	root, err := os.MkdirTemp("", "astra-bench-"+testCase.ID+"-")

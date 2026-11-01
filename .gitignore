@@ -1,4 +1,6 @@
 /bin/
+/dist/
+/npm/astra-ai/node_modules/
 *.exe
 *.test
 *.test.exe

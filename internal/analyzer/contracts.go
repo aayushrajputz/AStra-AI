@@ -2,7 +2,10 @@ package analyzer
 
 import (
 	"fmt"
+	"go/ast"
+	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/astra-ai/astra/internal/diff"
@@ -134,6 +137,61 @@ func indexContractSchemas(files []sourceFile) map[string]contractSchema {
 				fields: parseContractFields(tokens, i+3, closeObject, true),
 			}
 		}
+		for _, declaration := range file.goFileDeclarations() {
+			general, ok := declaration.(*ast.GenDecl)
+			if !ok || general.Tok.String() != "type" {
+				continue
+			}
+			for _, spec := range general.Specs {
+				typeSpec, ok := spec.(*ast.TypeSpec)
+				if !ok {
+					continue
+				}
+				structType, ok := typeSpec.Type.(*ast.StructType)
+				if !ok {
+					continue
+				}
+				fields := make(map[string]contractField)
+				for _, field := range structType.Fields.List {
+					if field.Tag == nil {
+						continue
+					}
+					tagValue, err := strconv.Unquote(field.Tag.Value)
+					if err != nil {
+						continue
+					}
+					tag := reflect.StructTag(tagValue)
+					jsonName := strings.Split(tag.Get("json"), ",")[0]
+					if jsonName == "-" {
+						continue
+					}
+					for _, fieldName := range field.Names {
+						if jsonName == "" {
+							jsonName = fieldName.Name
+						}
+						optional := !containsTagValue(tag.Get("binding"), "required") &&
+							!containsTagValue(tag.Get("validate"), "required")
+						if containsTagValue(tag.Get("json"), "omitempty") ||
+							containsTagValue(tag.Get("json"), "omitzero") {
+							optional = true
+						}
+						fields[jsonName] = contractField{
+							name: jsonName, typeName: goTypeName(field.Type), optional: optional,
+							column: 0,
+						}
+					}
+				}
+				if len(fields) == 0 {
+					continue
+				}
+				schemas[file.path+"\x00"+typeSpec.Name.Name] = contractSchema{
+					name: typeSpec.Name.Name, file: file.path,
+					startLine: file.goFile.fileSet.Position(typeSpec.Pos()).Line,
+					endLine:   file.goFile.fileSet.Position(typeSpec.End()).Line,
+					fields:    fields,
+				}
+			}
+		}
 	}
 	for range len(aliases) {
 		changed := false
@@ -158,6 +216,22 @@ func indexContractSchemas(files []sourceFile) map[string]contractSchema {
 		}
 	}
 	return schemas
+}
+
+func (file sourceFile) goFileDeclarations() []ast.Decl {
+	if file.goFile == nil {
+		return nil
+	}
+	return file.goFile.file.Decls
+}
+
+func containsTagValue(value, expected string) bool {
+	for _, part := range strings.Split(value, ",") {
+		if part == expected {
+			return true
+		}
+	}
+	return false
 }
 
 func inferredSchemaName(tokens []token, start int) string {
@@ -417,6 +491,11 @@ func indexRouteContracts(routes []Route, files []sourceFile, schemas map[string]
 		}
 		binding := routeContract{}
 		for _, handler := range route.Handlers {
+			if file.goFile != nil {
+				binding.request = append(binding.request, goHandlerRequestSchemas(
+					handler, file, fileByPath, schemas)...)
+				continue
+			}
 			requestType, responseType := handlerContractTypes(file, handler)
 			if name := findSchemaReference(requestType, file, schemas); name != "" {
 				binding.request = appendUniqueContractRef(binding.request, resolveSchemaReference(name, file, schemas))
@@ -428,6 +507,71 @@ func indexRouteContracts(routes []Route, files []sourceFile, schemas map[string]
 		bindings[routeKey(route)] = binding
 	}
 	return bindings
+}
+
+func goHandlerRequestSchemas(handler string, routeFile sourceFile, files map[string]sourceFile,
+	schemas map[string]contractSchema) []contractReference {
+	targetFile := routeFile
+	targetName := handler
+	if imported, ok := routeFile.imports[handler]; ok {
+		targetFile = files[imported.file]
+		targetName = imported.symbol
+	}
+	if targetFile.goFile == nil {
+		return nil
+	}
+	var result []contractReference
+	for _, declaration := range targetFile.goFile.file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != targetName || function.Body == nil {
+			continue
+		}
+		hasBinder := false
+		types := make(map[string]bool)
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			switch current := node.(type) {
+			case *ast.CallExpr:
+				if selector, ok := current.Fun.(*ast.SelectorExpr); ok &&
+					(strings.Contains(selector.Sel.Name, "Bind") || strings.Contains(selector.Sel.Name, "Decode")) {
+					hasBinder = true
+				}
+			case *ast.ValueSpec:
+				if current.Type != nil {
+					if name := goSchemaTypeName(current.Type); name != "" {
+						types[name] = true
+					}
+				}
+			case *ast.CompositeLit:
+				if name := goSchemaTypeName(current.Type); name != "" {
+					types[name] = true
+				}
+			}
+			return true
+		})
+		if !hasBinder {
+			continue
+		}
+		for name := range types {
+			if _, exists := schemas[targetFile.path+"\x00"+name]; exists {
+				result = appendUniqueContractRef(result, contractReference{
+					name: name, file: targetFile.path,
+				})
+			}
+		}
+	}
+	return result
+}
+
+func goSchemaTypeName(expression ast.Expr) string {
+	switch current := expression.(type) {
+	case *ast.Ident:
+		return current.Name
+	case *ast.StarExpr:
+		return goSchemaTypeName(current.X)
+	case *ast.SelectorExpr:
+		return current.Sel.Name
+	}
+	return ""
 }
 
 func appendUniqueContractRef(references []contractReference, reference contractReference) []contractReference {
@@ -678,6 +822,9 @@ func changedContractField(source string) (contractField, bool) {
 	if err != nil {
 		return contractField{}, false
 	}
+	if field, ok := changedGoContractField(tokens); ok {
+		return field, true
+	}
 	for i := 0; i+1 < len(tokens); i++ {
 		if tokens[i].kind != identifierToken {
 			continue
@@ -710,6 +857,25 @@ func changedContractField(source string) (contractField, bool) {
 		return field, true
 	}
 	return contractField{}, false
+}
+
+func changedGoContractField(tokens []token) (contractField, bool) {
+	if len(tokens) < 2 || tokens[0].kind != identifierToken || tokens[1].kind != identifierToken {
+		return contractField{}, false
+	}
+	field := contractField{
+		name: tokens[0].text, typeName: tokens[1].text, column: tokens[0].column, optional: true,
+	}
+	if len(tokens) > 2 && tokens[2].kind == stringToken {
+		tag := reflect.StructTag(tokens[2].text)
+		jsonTag := strings.Split(tag.Get("json"), ",")
+		if len(jsonTag) > 0 && jsonTag[0] != "" && jsonTag[0] != "-" {
+			field.name = jsonTag[0]
+		}
+		field.optional = !containsTagValue(tag.Get("binding"), "required") &&
+			!containsTagValue(tag.Get("validate"), "required")
+	}
+	return field, true
 }
 
 func changedZodType(typeName string) string {

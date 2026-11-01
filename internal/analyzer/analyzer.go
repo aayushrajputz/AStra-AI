@@ -34,11 +34,24 @@ type Report struct {
 }
 
 type RouteImpact struct {
-	Route      Route    `json:"route"`
-	Chain      []string `json:"chain,omitempty"`
-	Reason     string   `json:"reason"`
-	Confidence string   `json:"confidence"`
-	Severity   string   `json:"severity"`
+	Route      Route      `json:"route"`
+	Chain      []string   `json:"chain,omitempty"`
+	Reason     string     `json:"reason"`
+	Confidence string     `json:"confidence"`
+	Severity   string     `json:"severity"`
+	Resolution string     `json:"resolution,omitempty"`
+	Symbol     string     `json:"symbol,omitempty"`
+	CallSites  []CallSite `json:"call_sites,omitempty"`
+}
+
+type CallSite struct {
+	Caller        string `json:"caller"`
+	Callee        string `json:"callee"`
+	File          string `json:"file"`
+	Line          int    `json:"line"`
+	ArgumentCount int    `json:"argument_count"`
+	HasSpread     bool   `json:"has_spread,omitempty"`
+	HasNamedArgs  bool   `json:"has_named_args,omitempty"`
 }
 
 type RouteExplanation struct {
@@ -68,6 +81,7 @@ type sourceFile struct {
 	path    string
 	tokens  []token
 	imports map[string]importedSymbol
+	goFile  *goSourceFile
 }
 
 type functionInfo struct {
@@ -78,6 +92,7 @@ type functionInfo struct {
 	bodyStart int
 	bodyEnd   int
 	calls     []string
+	callSites []CallSite
 	imports   map[string]importedSymbol
 }
 
@@ -85,6 +100,7 @@ type functionParameter struct {
 	name     string
 	typeName string
 	optional bool
+	variadic bool
 }
 
 type functionSignature struct {
@@ -130,10 +146,7 @@ func AnalyzeDiff(root string, changes []diff.File) (*Report, error) {
 	if err != nil {
 		return nil, err
 	}
-	report := analyzeFiles(files)
-	functions := indexFunctions(files)
-	report.AffectedRoutes = affectedRoutes(report.Routes, changes, functions, importsByFile(files), files)
-	return report, nil
+	return analyzeDiffFiles(files, changes), nil
 }
 
 func AnalyzeDiffWithCache(root string, changes []diff.File, cacheDir string) (*Report, error) {
@@ -141,10 +154,32 @@ func AnalyzeDiffWithCache(root string, changes []diff.File, cacheDir string) (*R
 	if err != nil {
 		return nil, err
 	}
+	return analyzeDiffFiles(files, changes), nil
+}
+
+func AnalyzeDiffWithContent(root, cacheDir string, changes []diff.File,
+	overrides map[string][]byte, excluded map[string]bool) (*Report, error) {
+	cache, err := openParseCache(cacheDir, root)
+	if err != nil {
+		return nil, err
+	}
+	files, err := loadFilesUsingContent(root, func(_ string, content []byte) ([]token, error) {
+		return cache.parse(content)
+	}, overrides, excluded)
+	if err != nil {
+		return nil, err
+	}
+	if err := cache.flush(); err != nil {
+		return nil, err
+	}
+	return analyzeDiffFiles(files, changes), nil
+}
+
+func analyzeDiffFiles(files []sourceFile, changes []diff.File) *Report {
 	report := analyzeFiles(files)
 	functions := indexFunctions(files)
 	report.AffectedRoutes = affectedRoutes(report.Routes, changes, functions, importsByFile(files), files)
-	return report, nil
+	return report
 }
 
 func BlastRadius(root, file, symbol string, line int) ([]RouteImpact, error) {
@@ -292,32 +327,53 @@ func loadFilesWithCache(root, cacheDir string) ([]sourceFile, error) {
 }
 
 func loadFilesUsing(root string, parse func(string, []byte) ([]token, error)) ([]sourceFile, error) {
+	return loadFilesUsingContent(root, parse, nil, nil)
+}
+
+func loadFilesUsingContent(root string, parse func(string, []byte) ([]token, error),
+	overrides map[string][]byte, excluded map[string]bool) ([]sourceFile, error) {
 	resolver, err := newModuleResolver(root)
 	if err != nil {
 		return nil, err
 	}
 	paths := make([]string, 0)
-	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() {
-			switch entry.Name() {
-			case ".git", "node_modules", "vendor", "dist", "build":
-				if path != root {
-					return filepath.SkipDir
-				}
+	if overrides != nil {
+		for relative := range overrides {
+			if excluded[relative] || !isSourceFile(relative) {
+				continue
 			}
-			return nil
+			paths = append(paths, filepath.Join(root, filepath.FromSlash(relative)))
 		}
-		if !isSourceFile(path) {
+	} else {
+		err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if entry.IsDir() {
+				switch entry.Name() {
+				case ".git", "node_modules", "vendor", "dist", "build":
+					if path != root {
+						return filepath.SkipDir
+					}
+				}
+				return nil
+			}
+			if !isSourceFile(path) {
+				return nil
+			}
+			relative, err := filepath.Rel(root, path)
+			if err != nil {
+				return err
+			}
+			if excluded[filepath.ToSlash(relative)] {
+				return nil
+			}
+			paths = append(paths, path)
 			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
-		paths = append(paths, path)
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
 	sort.Strings(paths)
 	files := make([]sourceFile, len(paths))
@@ -332,10 +388,18 @@ func loadFilesUsing(root string, parse func(string, []byte) ([]token, error)) ([
 				defer wait.Done()
 				for index := range jobs {
 					path := paths[index]
-					content, err := os.ReadFile(path)
+					relative, err := filepath.Rel(root, path)
 					if err != nil {
-						errorsByFile[index] = fmt.Errorf("read %s: %w", path, err)
+						errorsByFile[index] = err
 						continue
+					}
+					content, overridden := overrides[filepath.ToSlash(relative)]
+					if !overridden {
+						content, err = os.ReadFile(path)
+						if err != nil {
+							errorsByFile[index] = fmt.Errorf("read %s: %w", path, err)
+							continue
+						}
 					}
 					var tokens []token
 					if parse == nil {
@@ -347,13 +411,15 @@ func loadFilesUsing(root string, parse func(string, []byte) ([]token, error)) ([
 						errorsByFile[index] = fmt.Errorf("parse %s: %w", path, err)
 						continue
 					}
-					relative, err := filepath.Rel(root, path)
-					if err != nil {
-						errorsByFile[index] = err
-						continue
-					}
 					file := sourceFile{path: filepath.ToSlash(relative), tokens: tokens}
 					file.imports = resolver.imports(file)
+					if strings.EqualFold(filepath.Ext(path), ".go") {
+						file.goFile, err = parseGoSource(path, content)
+						if err != nil {
+							errorsByFile[index] = fmt.Errorf("parse %s: %w", path, err)
+							continue
+						}
+					}
 					files[index] = file
 				}
 			}()
@@ -370,12 +436,13 @@ func loadFilesUsing(root string, parse func(string, []byte) ([]token, error)) ([
 		}
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].path < files[j].path })
+	linkGoImports(root, files)
 	return files, nil
 }
 
 func isSourceFile(path string) bool {
 	switch strings.ToLower(filepath.Ext(path)) {
-	case ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs":
+	case ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go":
 		return true
 	default:
 		return false
@@ -423,11 +490,20 @@ func analyzeFiles(files []sourceFile) *Report {
 			}
 
 			if routeMethods[method] {
-				if len(args) == 0 || args[0][0] >= args[0][1] || tokens[args[0][0]].kind != stringToken {
+				if len(args) < 2 || args[0][0] >= args[0][1] {
+					continue
+				}
+				if tokens[args[0][0]].kind != stringToken {
+					if !isRouteCallCandidate(receiver, tokens, args) {
+						continue
+					}
 					report.Warnings = append(report.Warnings, Warning{
 						File: file.path, Line: tokens[i].line,
 						Message: "route path is dynamic or unsupported; route was not indexed",
 					})
+					continue
+				}
+				if !isRouteCallCandidate(receiver, tokens, args) {
 					continue
 				}
 				route := Route{
@@ -491,6 +567,8 @@ func analyzeFiles(files []sourceFile) *Report {
 	}
 	nestRoutes, _ := analyzeNestFiles(files)
 	report.Routes = append(report.Routes, nestRoutes...)
+	goRoutes, _ := analyzeGoFiles(files)
+	report.Routes = append(report.Routes, goRoutes...)
 	sort.Slice(report.Routes, func(i, j int) bool {
 		a, b := report.Routes[i], report.Routes[j]
 		if a.File != b.File {
@@ -505,6 +583,98 @@ func analyzeFiles(files []sourceFile) *Report {
 		return a.Path < b.Path
 	})
 	return report
+}
+
+func isRouteCallCandidate(receiver string, tokens []token, args [][2]int) bool {
+	name := strings.ToLower(receiver)
+	switch {
+	case name == "redis", name == "cache", name == "map", strings.Contains(name, "redis"),
+		strings.Contains(name, "cache"), strings.Contains(name, "map"), name == "req",
+		name == "request", strings.Contains(name, "client"), name == "db",
+		name == "database", name == "http", name == "axios":
+		return false
+	}
+	switch name {
+	case "router", "app", "server", "api", "group", "v1", "v2", "r", "fastify":
+		return true
+	}
+	if strings.HasSuffix(name, "router") || strings.HasSuffix(name, "routes") {
+		return true
+	}
+	for _, arg := range args[1:] {
+		if looksLikeRouteHandler(tokens, arg) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeRouteHandler(tokens []token, arg [2]int) bool {
+	if arg[0] >= arg[1] {
+		return false
+	}
+	first := arg[0]
+	if tokens[first].text == "async" {
+		first++
+	}
+	if first >= arg[1] {
+		return false
+	}
+	if tokens[first].text == "function" || tokens[first].text == "(" {
+		return true
+	}
+	for index := first; index < arg[1]; index++ {
+		if tokens[index].text == "=>" {
+			return true
+		}
+	}
+	if tokens[first].kind != identifierToken {
+		return false
+	}
+	name := strings.ToLower(tokens[first].text)
+	if strings.Contains(name, "handler") || strings.Contains(name, "middleware") ||
+		strings.Contains(name, "controller") || strings.HasSuffix(name, "callback") {
+		return true
+	}
+	for index := 0; index+2 < len(tokens); index++ {
+		if tokens[index].text != "function" {
+			continue
+		}
+		functionName := index + 1
+		if tokens[functionName].text == "*" {
+			functionName++
+		}
+		if functionName >= len(tokens) || tokens[functionName].text != tokens[first].text ||
+			functionName+1 >= len(tokens) || tokens[functionName+1].text != "(" {
+			continue
+		}
+		close := matchingToken(tokens, functionName+1, "(", ")")
+		if close < 0 {
+			continue
+		}
+		params := splitArguments(tokens, functionName+2, close)
+		if len(params) >= 2 && isRequestParameter(tokens, params[0]) &&
+			isResponseParameter(tokens, params[1]) {
+			return true
+		}
+	}
+	return false
+}
+
+func isRequestParameter(tokens []token, param [2]int) bool {
+	if param[0] >= param[1] || tokens[param[0]].kind != identifierToken {
+		return false
+	}
+	name := strings.ToLower(tokens[param[0]].text)
+	return name == "req" || name == "request"
+}
+
+func isResponseParameter(tokens []token, param [2]int) bool {
+	if param[0] >= param[1] || tokens[param[0]].kind != identifierToken {
+		return false
+	}
+	name := strings.ToLower(tokens[param[0]].text)
+	return name == "res" || name == "response"
 }
 
 func fastifyRegistration(tokens []token, args [][2]int) (string, string, bool) {
@@ -567,6 +737,9 @@ func expressRouteChain(file string, tokens []token, receiver, path string, route
 func indexFunctions(files []sourceFile) map[string][]functionInfo {
 	functions := make(map[string][]functionInfo)
 	for _, file := range files {
+		if file.goFile != nil {
+			continue
+		}
 		local := make([]functionInfo, 0)
 		for i := 0; i < len(file.tokens); i++ {
 			if file.tokens[i].text == "function" {
@@ -574,10 +747,24 @@ func indexFunctions(files []sourceFile) map[string][]functionInfo {
 				if nameIndex < len(file.tokens) && file.tokens[nameIndex].text == "*" {
 					nameIndex++
 				}
-				if nameIndex >= len(file.tokens) || file.tokens[nameIndex].kind != identifierToken {
+				if nameIndex >= len(file.tokens) {
 					continue
 				}
-				openParen := nameIndex + 1
+				startLine := file.tokens[i].line
+				if variableIndex, ok := variableDeclarationNameBefore(file.tokens, i); ok {
+					nameIndex = variableIndex
+					startLine = file.tokens[variableIndex].line
+				} else if file.tokens[nameIndex].text == "(" ||
+					file.tokens[nameIndex].kind != identifierToken {
+					continue
+				}
+				openParen := i + 1
+				if openParen < len(file.tokens) && file.tokens[openParen].text == "*" {
+					openParen++
+				}
+				if openParen < len(file.tokens) && file.tokens[openParen].kind == identifierToken {
+					openParen++
+				}
 				for openParen < len(file.tokens) && file.tokens[openParen].text != "(" &&
 					file.tokens[openParen].text != "{" && file.tokens[openParen].text != ";" {
 					openParen++
@@ -603,7 +790,7 @@ func indexFunctions(files []sourceFile) map[string][]functionInfo {
 				}
 				local = append(local, functionInfo{
 					name: file.tokens[nameIndex].text, file: file.path,
-					startLine: file.tokens[i].line, endLine: file.tokens[bodyEnd].line,
+					startLine: startLine, endLine: file.tokens[bodyEnd].line,
 					bodyStart: bodyStart + 1, bodyEnd: bodyEnd, imports: file.imports,
 				})
 				continue
@@ -634,7 +821,27 @@ func indexFunctions(files []sourceFile) map[string][]functionInfo {
 			for j := local[i].bodyStart; j+1 < local[i].bodyEnd; j++ {
 				if file.tokens[j].kind == identifierToken && file.tokens[j+1].text == "(" &&
 					!isControlWord(file.tokens[j].text) {
-					called[file.tokens[j].text] = true
+					callee := file.tokens[j].text
+					called[callee] = true
+					close := matchingToken(file.tokens, j+1, "(", ")")
+					if close > j+1 && close <= local[i].bodyEnd {
+						arguments := splitArguments(file.tokens, j+2, close)
+						site := CallSite{
+							Caller: local[i].name, Callee: callee, File: file.path,
+							Line: file.tokens[j].line, ArgumentCount: len(arguments),
+						}
+						for _, argument := range arguments {
+							for tokenIndex := argument[0]; tokenIndex < argument[1]; tokenIndex++ {
+								switch file.tokens[tokenIndex].text {
+								case "...":
+									site.HasSpread = true
+								case ":":
+									site.HasNamedArgs = true
+								}
+							}
+						}
+						local[i].callSites = append(local[i].callSites, site)
+					}
 				}
 			}
 			for name := range called {
@@ -648,19 +855,111 @@ func indexFunctions(files []sourceFile) map[string][]functionInfo {
 	for name, definitions := range nestFunctions {
 		functions[name] = append(functions[name], definitions...)
 	}
+	_, goFunctions := analyzeGoFiles(files)
+	for name, definitions := range goFunctions {
+		functions[name] = append(functions[name], definitions...)
+	}
 	return functions
 }
 
 func arrowName(tokens []token, arrow int) (int, int, bool) {
-	for i := arrow - 1; i >= 1 && arrow-i <= 12; i-- {
-		if tokens[i].text == "=" && tokens[i-1].kind == identifierToken {
-			return i - 1, i, true
-		}
-		if tokens[i].text == ";" || tokens[i].text == "{" || tokens[i].text == "}" {
-			break
+	parenDepth, bracketDepth, braceDepth := 0, 0, 0
+	for i := arrow - 1; i >= 0; i-- {
+		switch tokens[i].text {
+		case ")":
+			parenDepth++
+		case "(":
+			if parenDepth > 0 {
+				parenDepth--
+			}
+		case "]":
+			bracketDepth++
+		case "[":
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+		case "}":
+			if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 {
+				return 0, 0, false
+			}
+			braceDepth++
+		case "{":
+			if braceDepth > 0 {
+				braceDepth--
+			} else if parenDepth == 0 && bracketDepth == 0 {
+				return 0, 0, false
+			}
+		case "=":
+			if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 {
+				if nameIndex, ok := variableDeclarationNameBefore(tokens, i); ok {
+					return nameIndex, i, true
+				}
+				if i > 0 && tokens[i-1].kind == identifierToken {
+					return i - 1, i, true
+				}
+			}
+		case ";":
+			if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 {
+				return 0, 0, false
+			}
 		}
 	}
 	return 0, 0, false
+}
+
+func variableDeclarationNameBefore(tokens []token, before int) (int, bool) {
+	parenDepth, bracketDepth, braceDepth := 0, 0, 0
+	for index := before - 1; index >= 0; index-- {
+		switch tokenText := tokens[index].text; tokenText {
+		case ")":
+			parenDepth++
+		case "(":
+			if parenDepth > 0 {
+				parenDepth--
+			}
+		case "]":
+			bracketDepth++
+		case "[":
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+		case "}":
+			braceDepth++
+		case "{":
+			if braceDepth > 0 {
+				braceDepth--
+			}
+		case ",":
+			if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 {
+				return variableNameAfter(tokens, index+1, before)
+			}
+		case ";":
+			if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 {
+				return 0, false
+			}
+		case "const", "let", "var":
+			if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 {
+				return variableNameAfter(tokens, index+1, before)
+			}
+		case "function":
+			if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 {
+				return 0, false
+			}
+		}
+	}
+	return 0, false
+}
+
+func variableNameAfter(tokens []token, start, end int) (int, bool) {
+	for index := start; index < end; index++ {
+		if tokens[index].kind == identifierToken {
+			return index, true
+		}
+		if tokens[index].text == "=" || tokens[index].text == "," {
+			return 0, false
+		}
+	}
+	return 0, false
 }
 
 func isControlWord(name string) bool {
@@ -760,7 +1059,8 @@ func affectedRoutes(routes []Route, changes []diff.File, functions map[string][]
 				if route, ok := changedRoute(change.Text, fileChange.Path, change.OldLine); ok {
 					impacts = append(impacts, RouteImpact{
 						Route: route, Reason: "route declaration was removed",
-						Confidence: "heuristic", Severity: "breaking",
+						Confidence: "exact", Severity: "breaking", Resolution: "unresolved",
+						Symbol: route.Method + " " + route.Path,
 					})
 					added[routeKey(route)] = true
 					matched = true
@@ -783,7 +1083,22 @@ func affectedRoutes(routes []Route, changes []diff.File, functions map[string][]
 		for name := range changedNames {
 			sortedChangedNames = append(sortedChangedNames, name)
 		}
-		sort.Strings(sortedChangedNames)
+		sort.Slice(sortedChangedNames, func(i, j int) bool {
+			priority := func(name string) int {
+				if finding, ok := signatureFindings[name]; ok && finding.severity == "breaking" {
+					return 2
+				}
+				if removedNames[name] {
+					return 2
+				}
+				return 0
+			}
+			leftPriority, rightPriority := priority(sortedChangedNames[i]), priority(sortedChangedNames[j])
+			if leftPriority != rightPriority {
+				return leftPriority > rightPriority
+			}
+			return sortedChangedNames[i] < sortedChangedNames[j]
+		})
 
 		for _, route := range routes {
 			if moduleLevel {
@@ -813,6 +1128,10 @@ func affectedRoutes(routes []Route, changes []diff.File, functions map[string][]
 				for _, changedName := range sortedChangedNames {
 					chain, ok := callChain(handler, route.File, changedName, fileChange.Path,
 						fileImports[route.File], functions, make(map[string]bool))
+					if !ok && changedName == handler &&
+						removedNames[changedName] && route.File == fileChange.Path {
+						chain, ok = []string{handler}, true
+					}
 					if !ok {
 						continue
 					}
@@ -824,9 +1143,20 @@ func affectedRoutes(routes []Route, changes []diff.File, functions map[string][]
 					if finding, ok := signatureFindings[changedName]; ok {
 						impacts[len(impacts)-1].Reason = finding.reason
 						impacts[len(impacts)-1].Severity = finding.severity
+						if finding.severity == "breaking" {
+							impact := &impacts[len(impacts)-1]
+							impact.Symbol = changedName
+							impact.CallSites, impact.Resolution = signatureCallSites(
+								changedName, newSignatures[changedName], functions, route, chain,
+							)
+						}
 					} else if removedNames[changedName] {
 						impacts[len(impacts)-1].Reason = "route depends on a removed function"
 						impacts[len(impacts)-1].Severity = "breaking"
+						impacts[len(impacts)-1].Resolution = "unresolved"
+						impacts[len(impacts)-1].Confidence = "exact"
+						impacts[len(impacts)-1].Symbol = changedName
+						impacts[len(impacts)-1].CallSites = callSitesFor(changedName, functions)
 					} else if oldSignatures[changedName].name != "" && newSignatures[changedName].name != "" {
 						impacts[len(impacts)-1].Reason = "function signature changed without a detected breaking parameter change"
 						impacts[len(impacts)-1].Severity = "non-breaking"
@@ -853,10 +1183,74 @@ func affectedRoutes(routes []Route, changes []diff.File, functions map[string][]
 	return impacts
 }
 
+func signatureCallSites(name string, signature functionSignature,
+	functions map[string][]functionInfo, route Route, chain []string) ([]CallSite, string) {
+	sites := callSitesFor(name, functions)
+	if len(sites) == 0 && len(chain) > 0 && chain[len(chain)-1] == name {
+		for _, handler := range route.Handlers {
+			if handler == name {
+				sites = append(sites, CallSite{
+					Caller: "HTTP client", Callee: name, File: route.File,
+					Line: route.Line, ArgumentCount: 0,
+				})
+				break
+			}
+		}
+	}
+	if len(sites) == 0 {
+		return nil, "resolved"
+	}
+	required := 0
+	for _, parameter := range signature.parameters {
+		if !parameter.optional && !parameter.variadic {
+			required++
+		}
+	}
+	maximum := len(signature.parameters)
+	for _, parameter := range signature.parameters {
+		if parameter.variadic {
+			maximum = int(^uint(0) >> 1)
+			break
+		}
+	}
+	incompatible := make([]CallSite, 0)
+	for _, site := range sites {
+		if site.HasSpread || site.HasNamedArgs ||
+			site.ArgumentCount < required || site.ArgumentCount > maximum {
+			incompatible = append(incompatible, site)
+		}
+	}
+	if len(incompatible) > 0 {
+		return incompatible, "unresolved"
+	}
+	return nil, "resolved"
+}
+
+func callSitesFor(name string, functions map[string][]functionInfo) []CallSite {
+	sites := make([]CallSite, 0)
+	for _, definitions := range functions {
+		for _, definition := range definitions {
+			for _, site := range definition.callSites {
+				matches := site.Callee == name
+				if imported, ok := definition.imports[site.Callee]; ok && imported.symbol == name {
+					matches = true
+				}
+				if matches {
+					sites = append(sites, site)
+				}
+			}
+		}
+	}
+	return sites
+}
+
 func parseFunctionSignature(source string) (functionSignature, bool) {
 	tokens, err := lex(source)
 	if err != nil {
 		return functionSignature{}, false
+	}
+	if len(tokens) > 0 && tokens[0].text == "func" {
+		return parseGoFunctionSignature(source)
 	}
 	nameIndex, openParen := -1, -1
 	for i := 0; i+1 < len(tokens); i++ {
@@ -881,12 +1275,22 @@ func parseFunctionSignature(source string) (functionSignature, bool) {
 			if !ok {
 				continue
 			}
+			parenDepth := 0
 			for j := i - 1; j >= 0; j-- {
-				if tokens[j].text == "(" {
-					openParen = j
+				switch tokens[j].text {
+				case ")":
+					parenDepth++
+				case "(":
+					if parenDepth > 0 {
+						parenDepth--
+					}
+					if parenDepth == 0 {
+						openParen = j
+					}
+				case ";":
 					break
 				}
-				if tokens[j].text == "=" || tokens[j].text == ";" {
+				if openParen >= 0 || tokens[j].text == ";" {
 					break
 				}
 			}
@@ -910,6 +1314,9 @@ func parseFunctionSignature(source string) (functionSignature, bool) {
 		}
 		parameter := functionParameter{}
 		for i := argument[0]; i < argument[1]; i++ {
+			if tokens[i].text == "..." {
+				parameter.variadic = true
+			}
 			if tokens[i].kind == identifierToken {
 				parameter.name = tokens[i].text
 				break
@@ -1045,6 +1452,9 @@ func changedFunctionName(source string) (string, bool) {
 	tokens, err := lex(source)
 	if err != nil {
 		return "", false
+	}
+	if signature, ok := parseGoFunctionSignature(source); ok {
+		return signature.name, true
 	}
 	if len(tokens) >= 2 && tokens[0].text == "function" && tokens[1].kind == identifierToken {
 		return tokens[1].text, true

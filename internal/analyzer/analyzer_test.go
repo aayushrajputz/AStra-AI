@@ -54,6 +54,90 @@ func TestAnalyzeReportsDynamicRoutePath(t *testing.T) {
 	}
 }
 
+func TestAnalyzeOnlyWarnsForDynamicPathsOnConfirmedRouteCalls(t *testing.T) {
+	root := filepath.Join("testdata", "route-extraction-guards")
+	report, err := Analyze(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Routes) != 1 || report.Routes[0].Method != "POST" ||
+		report.Routes[0].Path != "/transfer" {
+		t.Fatalf("non-route get calls were misidentified as routes: %#v", report.Routes)
+	}
+	if len(report.Warnings) != 1 || report.Warnings[0].Message !=
+		"route path is dynamic or unsupported; route was not indexed" {
+		t.Fatalf("expected only the confirmed app dynamic-path warning, got %#v", report.Warnings)
+	}
+}
+
+func TestAnalyzeDiffMapsExportedArrowControllerChangeToOnlyItsRoute(t *testing.T) {
+	root := filepath.Join("testdata", "exported-arrow-controller")
+	changes := []diff.File{{
+		Path: "routes.ts", Status: diff.Modified,
+		Changes: []diff.Change{{
+			Kind: diff.AddedChange, NewLine: 2, Text: "await processTransfer(req.body);",
+		}},
+	}}
+	report, err := AnalyzeDiff(root, changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.AffectedRoutes) != 1 {
+		t.Fatalf("got %d affected routes, want only POST /transfer: %#v",
+			len(report.AffectedRoutes), report.AffectedRoutes)
+	}
+	impact := report.AffectedRoutes[0]
+	if impact.Route.Method != "POST" || impact.Route.Path != "/transfer" ||
+		impact.Confidence != "heuristic" || impact.Severity != "potential" {
+		t.Fatalf("exported arrow function change mapped incorrectly: %#v", impact)
+	}
+}
+
+func TestAnalyzeDiffMapsConstFunctionExpressionChangeToOnlyItsRoute(t *testing.T) {
+	root := filepath.Join("testdata", "exported-arrow-controller")
+	changes := []diff.File{{
+		Path: "routes.ts", Status: diff.Modified,
+		Changes: []diff.Change{{
+			Kind: diff.AddedChange, NewLine: 6, Text: `res.send("ok");`,
+		}},
+	}}
+	report, err := AnalyzeDiff(root, changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.AffectedRoutes) != 1 {
+		t.Fatalf("got %d affected routes, want only GET /status: %#v",
+			len(report.AffectedRoutes), report.AffectedRoutes)
+	}
+	impact := report.AffectedRoutes[0]
+	if impact.Route.Method != "GET" || impact.Route.Path != "/status" ||
+		impact.Confidence != "heuristic" || impact.Severity != "potential" {
+		t.Fatalf("const function-expression change mapped incorrectly: %#v", impact)
+	}
+}
+
+func TestAnalyzeDiffMapsArrowFunctionInMultiDeclaratorToItsRoute(t *testing.T) {
+	root := filepath.Join("testdata", "multi-arrow-declaration")
+	changes := []diff.File{{
+		Path: "routes.ts", Status: diff.Modified,
+		Changes: []diff.Change{{
+			Kind: diff.AddedChange, NewLine: 5, Text: "await processTransfer(req.body);",
+		}},
+	}}
+	report, err := AnalyzeDiff(root, changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.AffectedRoutes) != 1 {
+		t.Fatalf("got %d affected routes, want only POST /transfer: %#v",
+			len(report.AffectedRoutes), report.AffectedRoutes)
+	}
+	if got := report.AffectedRoutes[0].Route.Method + " " + report.AffectedRoutes[0].Route.Path; got != "POST /transfer" {
+		t.Fatalf("multi-declarator arrow change mapped to %q, want POST /transfer: %#v",
+			got, report.AffectedRoutes[0])
+	}
+}
+
 func TestAnalyzeIgnoresRouteTextInCommentsAndStrings(t *testing.T) {
 	root := t.TempDir()
 	writeSource(t, root, "server.js", `// app.get("/comment", handler);
@@ -180,6 +264,30 @@ func TestAnalyzeDiffClassifiesSignatureChanges(t *testing.T) {
 			newLine:      "function getUser(req: Request, id?: number) {}",
 			wantSeverity: "non-breaking",
 		},
+		{
+			name:         "defaulted parameter added",
+			oldLine:      "function getUser(req: Request) {}",
+			newLine:      `function getUser(req: Request, currency: string = "INR") {}`,
+			wantSeverity: "non-breaking",
+		},
+		{
+			name:         "required parameter gains default",
+			oldLine:      "function getUser(req: Request, currency: string) {}",
+			newLine:      `function getUser(req: Request, currency: string = "INR") {}`,
+			wantSeverity: "non-breaking",
+		},
+		{
+			name:         "optional exported arrow parameter added",
+			oldLine:      "export const getUser = (req: Request) => {};",
+			newLine:      "export const getUser = (req: Request, currency?: string) => {};",
+			wantSeverity: "non-breaking",
+		},
+		{
+			name:         "defaulted exported arrow parameter added",
+			oldLine:      "export const getUser = (req: Request) => {};",
+			newLine:      `export const getUser = (req: Request, currency: string = "INR") => {};`,
+			wantSeverity: "non-breaking",
+		},
 	}
 
 	for _, test := range tests {
@@ -203,6 +311,114 @@ func TestAnalyzeDiffClassifiesSignatureChanges(t *testing.T) {
 			}
 			if got := report.AffectedRoutes[0].Severity; got != test.wantSeverity {
 				t.Fatalf("severity = %q, want %q; impact: %#v", got, test.wantSeverity, report.AffectedRoutes[0])
+			}
+		})
+	}
+}
+
+func TestBreakingSignatureTracksResolvedAndUnresolvedCallSites(t *testing.T) {
+	tests := []struct {
+		name          string
+		updatedCaller bool
+		wantStatus    string
+		wantIncompat  int
+	}{
+		{name: "all callers updated", updatedCaller: true, wantStatus: "resolved"},
+		{name: "one caller stale", updatedCaller: false, wantStatus: "unresolved", wantIncompat: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			newCaller := "fetchData(req.params.id, tenant)"
+			if !test.updatedCaller {
+				newCaller = "fetchData(req.params.id)"
+			}
+			writeSource(t, root, "routes.ts", `function fetchData(id: string) {}
+function getUser(req, res) {
+  `+newCaller+`;
+}
+app.get("/users/:id", getUser);
+`)
+			changes := []diff.File{{
+				Path: "routes.ts", Status: diff.Modified,
+				Changes: []diff.Change{
+					{Kind: diff.DeletedChange, OldLine: 1, Text: "function fetchData(id: string) {}"},
+					{Kind: diff.AddedChange, NewLine: 1, Text: "function fetchData(id: string, tenant: string) {}"},
+					{Kind: diff.DeletedChange, OldLine: 3, Text: "  fetchData(req.params.id);"},
+					{Kind: diff.AddedChange, NewLine: 3, Text: "  fetchData(req.params.id, tenant);"},
+				},
+			}}
+			if !test.updatedCaller {
+				changes[0].Changes[3].Text = "  fetchData(req.params.id);"
+			}
+			report, err := AnalyzeDiff(root, changes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(report.AffectedRoutes) != 1 {
+				t.Fatalf("got %d route impacts, want 1: %#v", len(report.AffectedRoutes), report.AffectedRoutes)
+			}
+			impact := report.AffectedRoutes[0]
+			if impact.Severity != "breaking" || impact.Resolution != test.wantStatus {
+				t.Fatalf("signature resolution = %q/%q; want breaking/%s: %#v",
+					impact.Severity, impact.Resolution, test.wantStatus, impact)
+			}
+			if len(impact.CallSites) != test.wantIncompat {
+				t.Fatalf("incompatible call sites = %#v; want %d", impact.CallSites, test.wantIncompat)
+			}
+			if test.wantIncompat == 1 && (impact.CallSites[0].File != "routes.ts" || impact.CallSites[0].Line != 3) {
+				t.Fatalf("stale caller location not reported: %#v", impact.CallSites[0])
+			}
+		})
+	}
+}
+
+func TestRemovedRoutesAndReachableFunctionsRemainUnresolved(t *testing.T) {
+	tests := []struct {
+		name       string
+		source     string
+		change     string
+		wantRoute  string
+		wantReason string
+	}{
+		{
+			name: "route removed",
+			source: `function getUser(req, res) {}
+`,
+			change:     `app.get("/users", getUser);`,
+			wantRoute:  "/users",
+			wantReason: "route declaration was removed",
+		},
+		{
+			name: "reachable function removed",
+			source: `function getUser(req, res) {
+  lookupUser();
+}
+app.get("/users", getUser);
+`,
+			change:     "function lookupUser() {}",
+			wantRoute:  "/users",
+			wantReason: "route depends on a removed function",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeSource(t, root, "server.ts", test.source)
+			report, err := AnalyzeDiff(root, []diff.File{{
+				Path: "server.ts", Status: diff.Modified,
+				Changes: []diff.Change{{Kind: diff.DeletedChange, OldLine: 10, Text: test.change}},
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(report.AffectedRoutes) != 1 {
+				t.Fatalf("got %d impacts, want 1: %#v", len(report.AffectedRoutes), report.AffectedRoutes)
+			}
+			impact := report.AffectedRoutes[0]
+			if impact.Route.Path != test.wantRoute || impact.Severity != "breaking" ||
+				impact.Resolution != "unresolved" || impact.Reason != test.wantReason {
+				t.Fatalf("removed item impact = %#v", impact)
 			}
 		})
 	}
@@ -637,6 +853,155 @@ func TestAnalyzeClassFieldInstanceResolvesMethodEdge(t *testing.T) {
 		len(impact.Chain) != 2 || impact.Chain[0] != "AccountsController.getAccount" ||
 		impact.Chain[1] != "AccountsService.findOne" {
 		t.Fatalf("class-field instance edge was not resolved: %#v", impact)
+	}
+}
+
+func TestAnalyzeGoGinRoutesAndCrossPackageImpact(t *testing.T) {
+	root := filepath.Join("testdata", "go-gin")
+	report, err := Analyze(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Routes) != 2 {
+		t.Fatalf("got %d Gin routes, want 2: %#v", len(report.Routes), report.Routes)
+	}
+	assertRoute(t, report.Routes, "GET", "/v1/users/:id", "handlers.UsersController.GetUser")
+	assertRoute(t, report.Routes, "POST", "/v1/users", "handlers.CreateUser")
+
+	changes := []diff.File{{
+		Path: "service/users.go", Status: diff.Modified,
+		Changes: []diff.Change{{Kind: diff.AddedChange, NewLine: 3, Text: "return user;"}},
+	}}
+	report, err = AnalyzeDiff(root, changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.AffectedRoutes) != 1 || report.AffectedRoutes[0].Route.Path != "/v1/users/:id" {
+		t.Fatalf("unexpected Gin service impact: %#v", report.AffectedRoutes)
+	}
+	if len(report.AffectedRoutes[0].Chain) != 2 ||
+		report.AffectedRoutes[0].Chain[0] != "handlers.UsersController.GetUser" ||
+		report.AffectedRoutes[0].Chain[1] != "FetchUser" {
+		t.Fatalf("Go import call chain was not resolved: %#v", report.AffectedRoutes[0].Chain)
+	}
+}
+
+func TestAnalyzeGoChiNestedRoutesAndCrossPackageImpact(t *testing.T) {
+	root := filepath.Join("testdata", "go-chi")
+	report, err := Analyze(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Routes) != 2 {
+		t.Fatalf("got %d Chi routes, want 2: %#v", len(report.Routes), report.Routes)
+	}
+	assertRoute(t, report.Routes, "GET", "/api/users", "handlers.ListUsers")
+	assertRoute(t, report.Routes, "POST", "/api/users", "handlers.CreateUser")
+
+	changes := []diff.File{{
+		Path: "service/users.go", Status: diff.Modified,
+		Changes: []diff.Change{{Kind: diff.AddedChange, NewLine: 3, Text: "return users;"}},
+	}}
+	report, err = AnalyzeDiff(root, changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.AffectedRoutes) != 1 || report.AffectedRoutes[0].Route.Path != "/api/users" {
+		t.Fatalf("unexpected Chi service impact: %#v", report.AffectedRoutes)
+	}
+	if len(report.AffectedRoutes[0].Chain) != 2 ||
+		report.AffectedRoutes[0].Chain[0] != "handlers.ListUsers" ||
+		report.AffectedRoutes[0].Chain[1] != "LoadUsers" {
+		t.Fatalf("Chi package call chain was not resolved: %#v", report.AffectedRoutes[0].Chain)
+	}
+}
+
+func TestAnalyzeGoEchoRoutesAndCrossPackageImpact(t *testing.T) {
+	root := filepath.Join("testdata", "go-echo")
+	report, err := Analyze(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Routes) != 2 {
+		t.Fatalf("got %d Echo routes, want 2: %#v", len(report.Routes), report.Routes)
+	}
+	assertRoute(t, report.Routes, "GET", "/v1/users/:id", "handlers.GetUser")
+	assertRoute(t, report.Routes, "POST", "/v1/users", "handlers.CreateUser")
+
+	changes := []diff.File{{
+		Path: "service/users.go", Status: diff.Modified,
+		Changes: []diff.Change{{Kind: diff.AddedChange, NewLine: 3, Text: "return user;"}},
+	}}
+	report, err = AnalyzeDiff(root, changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.AffectedRoutes) != 1 || report.AffectedRoutes[0].Route.Path != "/v1/users/:id" {
+		t.Fatalf("unexpected Echo service impact: %#v", report.AffectedRoutes)
+	}
+	if len(report.AffectedRoutes[0].Chain) != 2 ||
+		report.AffectedRoutes[0].Chain[0] != "handlers.GetUser" ||
+		report.AffectedRoutes[0].Chain[1] != "FetchUser" {
+		t.Fatalf("Echo package call chain was not resolved: %#v", report.AffectedRoutes[0].Chain)
+	}
+}
+
+func TestAnalyzeGoStructTagsClassifyRemovedRequestField(t *testing.T) {
+	root := filepath.Join("testdata", "go-gin")
+	changes := []diff.File{{
+		Path: "handlers/users.go", Status: diff.Modified,
+		Changes: []diff.Change{{
+			Kind: diff.DeletedChange, OldLine: 7,
+			Text: "Name string `json:\"name\" binding:\"required\"`",
+		}},
+	}}
+	report, err := AnalyzeDiff(root, changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.AffectedRoutes) != 1 {
+		t.Fatalf("got %d affected routes, want 1: %#v", len(report.AffectedRoutes), report.AffectedRoutes)
+	}
+	impact := report.AffectedRoutes[0]
+	if impact.Route.Path != "/v1/users" || impact.Severity != "breaking" ||
+		!strings.Contains(impact.Reason, `"name"`) {
+		t.Fatalf("Go JSON tag field removal was not classified as breaking: %#v", impact)
+	}
+}
+
+func TestAnalyzeGoDiffClassifiesAddedRequiredParameterAsBreaking(t *testing.T) {
+	root := t.TempDir()
+	writeSource(t, root, "go.mod", "module example.com/fixture\n\ngo 1.24\n")
+	writeSource(t, root, "routes.go", `package main
+import (
+	"github.com/gin-gonic/gin"
+	"example.com/fixture/handlers"
+)
+func routes() {
+	router := gin.Default()
+	router.GET("/users", handlers.GetUser)
+}
+`)
+	writeSource(t, root, "handlers/handler.go", `package handlers
+import "example.com/fixture/service"
+func GetUser() {
+	service.FetchUser()
+}
+`)
+	writeSource(t, root, "service/service.go", "package service\nfunc FetchUser(id string, tenant string) {}\n")
+
+	report, err := AnalyzeDiff(root, []diff.File{{
+		Path: "service/service.go", Status: diff.Modified,
+		Changes: []diff.Change{
+			{Kind: diff.DeletedChange, OldLine: 2, Text: "func FetchUser(id string) {}"},
+			{Kind: diff.AddedChange, NewLine: 2, Text: "func FetchUser(id string, tenant string) {}"},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.AffectedRoutes) != 1 || report.AffectedRoutes[0].Severity != "breaking" {
+		t.Fatalf("Go required parameter addition was not breaking: %#v", report.AffectedRoutes)
 	}
 }
 

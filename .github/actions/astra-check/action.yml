@@ -6,7 +6,11 @@ inputs:
     required: true
   github-token:
     description: Token with pull request comment write access.
-    required: true
+    required: false
+  fail_on_error:
+    description: Fail the gate when AStra cannot analyze the pull request.
+    required: false
+    default: "true"
 outputs:
   status:
     description: AStra gate status (pass or fail).
@@ -28,55 +32,26 @@ runs:
       shell: bash
       env:
         ASTRA_BASE: ${{ inputs.base }}
+        ASTRA_FAIL_ON_ERROR: ${{ inputs.fail_on_error }}
       run: |
         set +e
-        "$RUNNER_TEMP/astra" check --base "$ASTRA_BASE" --json --gate > "$RUNNER_TEMP/astra-report.json"
+        "$RUNNER_TEMP/astra" check --base "$ASTRA_BASE" --json --gate > "$RUNNER_TEMP/astra-report.json" 2> "$RUNNER_TEMP/astra-error.txt"
         astra_exit=$?
         set -e
-        node - "$RUNNER_TEMP/astra-report.json" "$GITHUB_OUTPUT" "$astra_exit" <<'NODE'
-        const fs = require("node:fs");
-        const [reportPath, outputPath, exitCode] = process.argv.slice(2);
-        const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
-        if (report.status !== "pass" && report.status !== "fail") {
-          throw new Error("AStra JSON report has no valid gate status");
-        }
-        fs.appendFileSync(outputPath, `status=${report.status}\nreport=${reportPath}\ncli_exit=${exitCode}\n`);
-        NODE
+        node .github/actions/astra-check/report.mjs \
+          "$RUNNER_TEMP/astra-report.json" "$GITHUB_EVENT_PATH" "$GITHUB_OUTPUT" \
+          "$astra_exit" "$ASTRA_FAIL_ON_ERROR" "$RUNNER_TEMP/astra-error.txt"
 
     - name: Update AStra pull request comment
-      if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false
+      if: steps.analyze.outputs.comment == 'true'
       uses: actions/github-script@v7
       env:
-        ASTRA_REPORT: ${{ steps.analyze.outputs.report }}
+        ASTRA_COMMENT: ${{ steps.analyze.outputs.comment_body }}
       with:
         github-token: ${{ inputs.github-token }}
         script: |
-          const fs = require("node:fs");
-          const report = JSON.parse(fs.readFileSync(process.env.ASTRA_REPORT, "utf8"));
+          const body = process.env.ASTRA_COMMENT;
           const marker = "<!-- astra-route-impact-report -->";
-          const escapeCell = value => String(value ?? "").replaceAll("|", "\\|").replaceAll("\n", " ").slice(0, 120);
-          const display = (severity) => report.severity_rules?.[severity] ?? severity;
-          const allRows = (report.affected_routes ?? []).map(impact => {
-            const route = impact.route;
-            const chain = (impact.chain ?? []).join(" → ");
-            return `| ${escapeCell(route.method)} | ${escapeCell(route.path)} | ${escapeCell(display(impact.severity))} | ${escapeCell(impact.confidence)} | ${escapeCell(impact.reason)} | ${escapeCell(chain)} |`;
-          });
-          const rows = allRows.slice(0, 50);
-          const body = [
-            marker,
-            `## AStra route impact: ${report.status.toUpperCase()}`,
-            "",
-            `Analyzed ${report.changed_files} changed file(s); ${report.routes.length} route(s) indexed.`,
-            "",
-            "| Method | Route | Severity | Confidence | Finding | Call chain |",
-            "|---|---|---|---|---|---|",
-            ...(rows.length ? rows : ["| — | — | — | — | No affected routes detected. | — |"]),
-            ...(allRows.length > rows.length ? ["", `Showing ${rows.length} of ${allRows.length} findings.`] : []),
-            "",
-            ...(report.violations?.length ? ["### Gate violations", ...report.violations.slice(0, 20).map(item => `- ${escapeCell(item)}`), ""] : []),
-            ...(report.warnings?.length ? ["### Warnings", ...report.warnings.slice(0, 20).map(item => `- \`${escapeCell(item.file)}:${item.line}\`: ${escapeCell(item.message)}`), ""] : []),
-            "_AStra analysis is deterministic and local; heuristic confidence and uncertainty warnings should be reviewed._"
-          ].join("\n");
           const { owner, repo } = context.repo;
           const issue_number = context.issue.number;
           const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });

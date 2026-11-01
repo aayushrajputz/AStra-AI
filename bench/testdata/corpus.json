@@ -1,6 +1,6 @@
 {
-  "name": "AStra M1 curated sample Git commits",
-  "source": "Synthetic, locally generated Git commits modeling controller, middleware, unrelated-file, and dynamic-route changes; not an external open-source benchmark corpus.",
+  "name": "AStra curated sample Git commits",
+  "source": "Synthetic, locally generated Git commits modeling TypeScript controller, middleware, unrelated-file, dynamic-route, and Go service changes; not an external open-source benchmark corpus.",
   "cases": [
     {
       "id": "controller-required-parameter",
@@ -37,6 +37,14 @@
       "breaking_routes": ["GET /items/:id"],
       "known_routes": ["GET /items/:id", "GET /health"],
       "uncertain_routes": ["GET /items/:id"]
+    },
+    {
+      "id": "go-gin-required-parameter",
+      "description": "A Gin route's in-module service function gains a required parameter.",
+      "directory": "go-gin-required-parameter",
+      "go_module": "example.com/benchapp",
+      "breaking_routes": ["GET /users/:id"],
+      "known_routes": ["GET /users/:id", "GET /health"]
     }
   ]
 }

@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "astra": {
+      "type": "stdio",
+      "command": "go",
+      "args": ["run", "./cmd/astra", "mcp"],
+      "cwd": "${workspaceFolder}"
+    }
+  }
+}

@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Test
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test npm launcher
+        run: npm test --prefix npm/astra-ai
+
+      - name: Release binaries
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+
+      - name: Publish npm package when a token is configured
+        if: env.NPM_TOKEN != ''
+        working-directory: npm/astra-ai
+        run: |
+          node -e "const fs=require('node:fs');const p=require('./package.json');p.version=process.env.GITHUB_REF_NAME.replace(/^v/,'');fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
+          npm config set //registry.npmjs.org/:_authToken "$NPM_TOKEN"
+          npm publish --access public
