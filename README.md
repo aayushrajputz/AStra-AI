@@ -37,7 +37,7 @@ In PowerShell, you can install the Windows x64 binary for the current user
 $installDir = Join-Path $HOME ".astra\bin"
 New-Item -ItemType Directory -Force $installDir | Out-Null
 Invoke-WebRequest `
-  "https://github.com/aayushrajputz/AStra-AI/releases/download/v0.2.4/astra_0.2.4_windows_amd64.exe" `
+  "https://github.com/aayushrajputz/AStra-AI/releases/download/v0.2.5/astra_0.2.5_windows_amd64.exe" `
   -OutFile (Join-Path $installDir "astra.exe")
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if (($userPath -split ";") -notcontains $installDir) {
@@ -73,7 +73,7 @@ npm test --prefix npm/astra-ai
 To publish an already-created GitHub release to npm, add the `NPM_TOKEN`
 repository secret, then run the **Publish npm package** workflow from the
 Actions tab and enter the release version without its `v` prefix (for example,
-`0.2.4`) and the npm account scope without `@` (for example, `trietitan`). This
+`0.2.5`) and the npm account scope without `@` (for example, `trietitan`). This
 publishes the package from that release tag without rebuilding or replacing
 its GitHub Release assets.
 

@@ -66,16 +66,56 @@ function constantTimeEqual(left, right) {
 }
 
 async function fetchBytes(fetchImpl, url, label) {
-  let response;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10 * 60 * 1000);
+  process.stderr.write(`Downloading AStra ${label} from GitHub Releases...\n`);
   try {
-    response = await fetchImpl(url);
+    let response;
+    try {
+      response = await fetchImpl(url, { signal: controller.signal });
+    } catch (error) {
+      if (error.name === "AbortError") {
+        throw new Error(`Timed out downloading AStra ${label} from ${url} after 10 minutes`, { cause: error });
+      }
+      throw new Error(`Could not download AStra ${label} from ${url}: ${error.message}`, { cause: error });
+    }
+    if (!response.ok) {
+      throw new Error(`Could not download AStra ${label}: HTTP ${response.status} for ${url}`);
+    }
+    if (!response.body) {
+      return Buffer.from(await response.arrayBuffer());
+    }
+    const reader = response.body.getReader();
+    const chunks = [];
+    let downloaded = 0;
+    let reported = 0;
+    const expected = Number(response.headers.get("content-length")) || 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(Buffer.from(value));
+      downloaded += value.byteLength;
+      if (label === "binary" && downloaded - reported >= 1024 * 1024) {
+        const progress = expected > 0
+          ? `${(downloaded / 1024 / 1024).toFixed(1)}/${(expected / 1024 / 1024).toFixed(1)} MB`
+          : `${(downloaded / 1024 / 1024).toFixed(1)} MB`;
+        process.stderr.write(`AStra binary download: ${progress}\n`);
+        reported = downloaded;
+      }
+    }
+    return Buffer.concat(chunks, downloaded);
   } catch (error) {
-    throw new Error(`Could not download AStra ${label} from ${url}: ${error.message}`, { cause: error });
+    if (error.message.startsWith("Could not download AStra") ||
+        error.message.startsWith("Timed out downloading AStra")) {
+      throw error;
+    }
+    if (controller.signal.aborted) {
+      throw new Error(`Timed out downloading AStra ${label} from ${url} after 10 minutes`, { cause: error });
+    }
+    throw new Error(`Could not read AStra ${label} from ${url}: ${error.message}`, { cause: error });
+  } finally {
+    clearTimeout(timeout);
   }
-  if (!response.ok) {
-    throw new Error(`Could not download AStra ${label}: HTTP ${response.status} for ${url}`);
-  }
-  return Buffer.from(await response.arrayBuffer());
 }
 
 async function ensureBinary(options = {}) {

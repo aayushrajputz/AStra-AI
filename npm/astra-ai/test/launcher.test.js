@@ -72,6 +72,33 @@ test("downloads a matching binary, verifies SHA-256, then reuses cache", async t
   assert.equal(requests, 2, "cached executable should not trigger another download");
 });
 
+test("streams large release downloads and reports progress", async t => {
+  const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "astra-package-progress-"));
+  t.after(() => fs.rm(cacheDir, { recursive: true, force: true }));
+  const payload = Buffer.alloc(2 * 1024 * 1024, 7);
+  const digest = crypto.createHash("sha256").update(payload).digest("hex");
+  const expectedAsset = "astra_0.1.0_linux_amd64";
+  const originalWrite = process.stderr.write;
+  let progressOutput = "";
+  process.stderr.write = chunk => {
+    progressOutput += String(chunk);
+    return true;
+  };
+  try {
+    const binaryPath = await ensureBinary({
+      version: "0.1.0", platform: "linux", arch: "x64", cacheDir,
+      releaseBaseURL: "https://release.example/v0.1.0",
+      fetchImpl: async url => url.endsWith("/checksums.txt")
+        ? new Response(`${digest}  ${expectedAsset}\n`)
+        : new Response(payload, { headers: { "content-length": String(payload.length) } }),
+    });
+    assert.deepEqual(await fs.readFile(binaryPath), payload);
+    assert.match(progressOutput, /AStra binary download: 2\.0\/2\.0 MB/);
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+});
+
 test("rejects a downloaded binary with a mismatching checksum", async t => {
   const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "astra-package-bad-checksum-"));
   t.after(() => fs.rm(cacheDir, { recursive: true, force: true }));
