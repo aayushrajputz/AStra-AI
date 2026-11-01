@@ -52,8 +52,20 @@ effect in new terminals. Releases are created from `v*` tags by GitHub Actions;
 each binary asset is accompanied by a SHA-256 checksum in `checksums.txt`.
 
 The npm launcher is tested in this repository but is not published yet: the
-unscoped `astra-ai` name is already owned by an unrelated npm package, and
-publishing also requires an npm token. To test the launcher locally:
+unscoped `astra-ai` name is already owned by an unrelated npm package. The
+scoped package is `@aayushrajputz/astra-ai`; once published, users can install
+it globally or run it with `npx`:
+
+```powershell
+npm install -g @aayushrajputz/astra-ai
+astra --help
+astra-ai list-routes
+npx @aayushrajputz/astra-ai check
+```
+
+Publishing requires an npm account that owns the `@aayushrajputz` scope and a
+GitHub Actions secret named `NPM_TOKEN`. To test the launcher locally without
+publishing:
 
 ```powershell
 npm test --prefix npm/astra-ai

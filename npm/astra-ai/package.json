@@ -1,5 +1,5 @@
 {
-  "name": "astra-ai",
+  "name": "@aayushrajputz/astra-ai",
   "version": "0.1.0",
   "description": "AStra local route impact analysis CLI",
   "homepage": "https://github.com/aayushrajputz/AStra-AI",
@@ -14,6 +14,7 @@
     "node": ">=18"
   },
   "bin": {
+    "astra": "bin/astra-ai.js",
     "astra-ai": "bin/astra-ai.js"
   },
   "files": [
