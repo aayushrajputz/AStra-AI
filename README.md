@@ -71,6 +71,12 @@ publishing:
 npm test --prefix npm/astra-ai
 ```
 
+To publish an already-created GitHub release to npm, add the `NPM_TOKEN`
+repository secret, then run the **Publish npm package** workflow from the
+Actions tab and enter the release version without its `v` prefix (for example,
+`0.2.3`). This publishes the package from that release tag without rebuilding
+or replacing its GitHub Release assets.
+
 ## Use
 
 Run commands from a Git working tree:

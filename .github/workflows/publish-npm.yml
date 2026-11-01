@@ -1,0 +1,49 @@
+name: Publish npm package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: npm version to publish (for example 0.2.3)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: v${{ inputs.version }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Validate release version
+        env:
+          PACKAGE_VERSION: ${{ inputs.version }}
+        run: |
+          node -e 'if (!/^\d+\.\d+\.\d+$/.test(process.env.PACKAGE_VERSION)) { throw new Error("version must be numeric major.minor.patch"); }'
+
+      - name: Test npm launcher
+        run: npm test --prefix npm/astra-ai
+
+      - name: Set package version
+        working-directory: npm/astra-ai
+        env:
+          PACKAGE_VERSION: ${{ inputs.version }}
+        run: |
+          node -e "const fs=require('node:fs');const p=require('./package.json');p.version=process.env.PACKAGE_VERSION;fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
+
+      - name: Publish scoped package
+        working-directory: npm/astra-ai
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
