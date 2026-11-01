@@ -51,10 +51,9 @@ Reopen PowerShell after installation for the persistent `PATH` update to take
 effect in new terminals. Releases are created from `v*` tags by GitHub Actions;
 each binary asset is accompanied by a SHA-256 checksum in `checksums.txt`.
 
-The npm launcher is tested in this repository but is not published yet: the
-unscoped `astra-ai` name is already owned by an unrelated npm package. The
-scoped package is `@trietitan/astra-ai`; users can install
-it globally or run it with `npx`:
+The npm launcher is published as `@trietitan/astra-ai` (the unscoped
+`astra-ai` name is owned by an unrelated npm package). Users can install it
+globally or run it with `npx`:
 
 ```powershell
 npm install -g @trietitan/astra-ai
@@ -63,9 +62,9 @@ astra-ai list-routes
 npx @trietitan/astra-ai check
 ```
 
-Publishing requires an npm account that owns the `@trietitan` scope and a
-GitHub Actions secret named `NPM_TOKEN`. To test the launcher locally without
-publishing:
+Publishing new versions requires an npm account that owns the `@trietitan`
+scope and a GitHub Actions secret named `NPM_TOKEN`. To test the launcher
+locally without publishing:
 
 ```powershell
 npm test --prefix npm/astra-ai
