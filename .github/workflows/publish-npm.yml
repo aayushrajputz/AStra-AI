@@ -7,6 +7,10 @@ on:
         description: npm version to publish (for example 0.2.3)
         required: true
         type: string
+      npm_scope:
+        description: npm account scope without @
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -29,8 +33,9 @@ jobs:
       - name: Validate release version
         env:
           PACKAGE_VERSION: ${{ inputs.version }}
+          NPM_SCOPE: ${{ inputs.npm_scope }}
         run: |
-          node -e 'if (!/^\d+\.\d+\.\d+$/.test(process.env.PACKAGE_VERSION)) { throw new Error("version must be numeric major.minor.patch"); }'
+          node -e 'if (!/^\d+\.\d+\.\d+$/.test(process.env.PACKAGE_VERSION)) { throw new Error("version must be numeric major.minor.patch"); } if (!/^[a-z0-9][a-z0-9._-]*$/.test(process.env.NPM_SCOPE)) { throw new Error("npm_scope must be a valid npm username/scope without @"); }'
 
       - name: Test npm launcher
         run: npm test --prefix npm/astra-ai
@@ -39,8 +44,9 @@ jobs:
         working-directory: npm/astra-ai
         env:
           PACKAGE_VERSION: ${{ inputs.version }}
+          NPM_SCOPE: ${{ inputs.npm_scope }}
         run: |
-          node -e "const fs=require('node:fs');const p=require('./package.json');p.version=process.env.PACKAGE_VERSION;fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
+          node -e "const fs=require('node:fs');const p=require('./package.json');p.name='@'+process.env.NPM_SCOPE+'/astra-ai';p.version=process.env.PACKAGE_VERSION;fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
 
       - name: Publish scoped package
         working-directory: npm/astra-ai
